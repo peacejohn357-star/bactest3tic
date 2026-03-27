@@ -18,13 +18,15 @@
   const TICK_LOG_MAX    = 5000;  // maximum in-memory tick log rows
 
   let cfg = {
-    spikeThreshold:   0.30,  // minimum % price-move considered a spike
-    reversalTicks:    1,     // consecutive opposite-direction ticks to confirm reversal
-    minSnapbackRatio: 0.5,   // reversal must retrace >= this fraction of spike distance
-    extremeLookback:  10,    // spike tip must be local high/low within last N ticks
-    cooldownTicks:    2,     // minimum ticks between new signals
-    minVolatilityPct: 0.03,  // skip signals when recent range is too flat (%)
-    debugSignals:     false, // log signal accept/reject reasons to console
+    spikeMode:        'auto',  // 'auto' | 'percent' | 'points'
+    spikeThreshold:   0.001,   // minimum % price-move considered a spike (permissive default for calibration)
+    minSpikePoints:   0.1,     // minimum absolute point-move for spike (used in 'points'/'auto' mode)
+    reversalTicks:    1,       // consecutive opposite-direction ticks to confirm reversal
+    minSnapbackRatio: 0.2,     // reversal must retrace >= this fraction of spike distance
+    extremeLookback:  4,       // spike tip must be local high/low within last N ticks
+    cooldownTicks:    1,       // minimum ticks between new signals
+    minVolatilityPct: 0.005,   // skip signals when recent range is too flat (%)
+    debugSignals:     true,    // log signal accept/reject reasons to console
   };
 
   // ── State ─────────────────────────────────────────────────────────────────
@@ -91,8 +93,20 @@
         <button id="tt-config-toggle">⚙ settings</button>
         <div id="tt-config">
           <div class="tt-config-row">
+            <label>Spike mode</label>
+            <select id="tt-cfg-spike-mode">
+              <option value="auto">auto</option>
+              <option value="percent">percent</option>
+              <option value="points">points</option>
+            </select>
+          </div>
+          <div class="tt-config-row">
             <label>Spike % threshold</label>
-            <input type="number" id="tt-cfg-spike" min="0.01" max="5" step="0.01" value="0.30">
+            <input type="number" id="tt-cfg-spike" min="0.0001" max="5" step="0.0001" value="0.001">
+          </div>
+          <div class="tt-config-row">
+            <label>Min spike points</label>
+            <input type="number" id="tt-cfg-spike-points" min="0" max="100" step="0.01" value="0.1">
           </div>
           <div class="tt-config-row">
             <label>Reversal ticks</label>
@@ -100,19 +114,19 @@
           </div>
           <div class="tt-config-row">
             <label>Snapback ratio (0–1)</label>
-            <input type="number" id="tt-cfg-snapback" min="0" max="1" step="0.05" value="0.5">
+            <input type="number" id="tt-cfg-snapback" min="0" max="1" step="0.05" value="0.2">
           </div>
           <div class="tt-config-row">
             <label>Extreme lookback</label>
-            <input type="number" id="tt-cfg-lookback" min="1" max="50" step="1" value="10">
+            <input type="number" id="tt-cfg-lookback" min="1" max="50" step="1" value="4">
           </div>
           <div class="tt-config-row">
             <label>Cooldown ticks</label>
-            <input type="number" id="tt-cfg-cooldown" min="0" max="20" step="1" value="2">
+            <input type="number" id="tt-cfg-cooldown" min="0" max="20" step="1" value="1">
           </div>
           <div class="tt-config-row">
             <label>Min volatility %</label>
-            <input type="number" id="tt-cfg-volpct" min="0" max="5" step="0.01" value="0.03">
+            <input type="number" id="tt-cfg-volpct" min="0" max="5" step="0.001" value="0.005">
           </div>
           <div class="tt-config-row">
             <label>Debug signals</label>
@@ -191,8 +205,19 @@
       cfg_el.classList.toggle('tt-open');
     });
 
+    document.getElementById('tt-cfg-spike-mode').addEventListener('change', function () {
+      cfg.spikeMode = this.value;
+      saveCfg();
+    });
+
     document.getElementById('tt-cfg-spike').addEventListener('change', function () {
-      cfg.spikeThreshold = parseFloat(this.value) || 0.30;
+      cfg.spikeThreshold = parseFloat(this.value) || 0.001;
+      saveCfg();
+    });
+
+    document.getElementById('tt-cfg-spike-points').addEventListener('change', function () {
+      const v = parseFloat(this.value);
+      cfg.minSpikePoints = (!isNaN(v) && v >= 0) ? v : 0.1;
       saveCfg();
     });
 
@@ -405,6 +430,16 @@
         price:            price,
         spike_pct:        (detection && typeof detection.spikePct === 'number')
                             ? detection.spikePct.toFixed(5) : '',
+        spike_points:     (detection && typeof detection.spikeAbs === 'number')
+                            ? detection.spikeAbs.toFixed(5) : '',
+        spike_threshold_used: (detection && typeof detection.spikeAbs === 'number')
+                            ? (detection.spikeMode === 'percent'
+                                ? cfg.spikeThreshold + '%'
+                                : detection.spikeMode === 'points'
+                                ? cfg.minSpikePoints + 'pts'
+                                : cfg.minSpikePoints + 'pts/' + cfg.spikeThreshold + '%')
+                            : '',
+        spike_mode_used:  (detection && detection.spikeMode) ? detection.spikeMode : '',
         signal_candidate: (detection && detection.candidate) ? detection.candidate : '',
         reject_reason:    (detection && detection.rejectReason) ? detection.rejectReason : '',
         signal_fired:     detection ? detection.fired : false,
@@ -467,14 +502,27 @@
     const spikeFrom = ticks[n - cfg.reversalTicks - 2].price;
     const spikeTo   = ticks[n - cfg.reversalTicks - 1].price;
     if (spikeFrom === 0) return null;
-    const spikePct  = Math.abs(spikeTo - spikeFrom) / spikeFrom * 100;
-    if (spikePct < cfg.spikeThreshold) {
-      if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: spike too small ${spikePct.toFixed(4)}% < threshold ${cfg.spikeThreshold}`);
-      return { spikePct, candidate: null, rejectReason: 'spike_threshold', fired: false };
+    const spikeAbs  = Math.abs(spikeTo - spikeFrom);
+    const spikePct  = spikeAbs / spikeFrom * 100;
+
+    // Determine spike pass based on configured mode
+    const mode = cfg.spikeMode || 'auto';
+    let spikePass;
+    if (mode === 'percent') {
+      spikePass = spikePct >= cfg.spikeThreshold;
+    } else if (mode === 'points') {
+      spikePass = spikeAbs >= cfg.minSpikePoints;
+    } else {
+      // auto: pass if either condition is met
+      spikePass = spikeAbs >= cfg.minSpikePoints || spikePct >= cfg.spikeThreshold;
+    }
+
+    if (!spikePass) {
+      if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: spike too small -- mode=${mode} spikeAbs=${spikeAbs.toFixed(5)} (need ${cfg.minSpikePoints}pts) spikePct=${spikePct.toFixed(5)}% (need ${cfg.spikeThreshold}%)`);
+      return { spikePct, spikeAbs, spikeMode: mode, candidate: null, rejectReason: 'spike_threshold', fired: false };
     }
 
     const spikeDir  = spikeTo > spikeFrom ? 1 : -1; // +1 = up spike, -1 = down spike
-    const spikeAbs  = Math.abs(spikeTo - spikeFrom);
     const candidate = spikeDir === 1 ? 'SELL' : 'BUY';
 
     // Verify reversal ticks all move opposite to spike
@@ -563,7 +611,7 @@
     if (cfg.debugSignals) console.log(`[3Tick][signal] ACCEPTED ${sigType} at price ${sigPrice} time ${sigTime}`);
 
     updateSignalsUI();
-    return { spikePct, candidate, rejectReason: null, fired: true };
+    return { spikePct, spikeAbs, spikeMode: mode, candidate, rejectReason: null, fired: true };
   }
 
   function scorePendingSignals (currentPrice) {
@@ -729,7 +777,7 @@
       showAlert('No tick log data to export. Start logging first.');
       return;
     }
-    const headers = ['epoch', 'iso_time', 'symbol', 'price', 'spike_pct', 'signal_candidate', 'reject_reason', 'signal_fired'];
+    const headers = ['epoch', 'iso_time', 'symbol', 'price', 'spike_pct', 'spike_points', 'spike_threshold_used', 'spike_mode_used', 'signal_candidate', 'reject_reason', 'signal_fired'];
     const rows = [headers].concat(tickLog.map(function (r) {
       return headers.map(function (h) { return r[h] !== undefined ? r[h] : ''; });
     }));
@@ -755,13 +803,15 @@
   // ── Config persistence ────────────────────────────────────────────────────
   function getDefaultCfg () {
     return {
-      spikeThreshold:   0.30,
+      spikeMode:        'auto',
+      spikeThreshold:   0.001,
+      minSpikePoints:   0.1,
       reversalTicks:    1,
-      minSnapbackRatio: 0.5,
-      extremeLookback:  10,
-      cooldownTicks:    2,
-      minVolatilityPct: 0.03,
-      debugSignals:     false,
+      minSnapbackRatio: 0.2,
+      extremeLookback:  4,
+      cooldownTicks:    1,
+      minVolatilityPct: 0.005,
+      debugSignals:     true,
     };
   }
 
@@ -784,8 +834,12 @@
 
   // ── Apply loaded config values to UI inputs ───────────────────────────────
   function applyConfigToUI () {
+    const sm  = document.getElementById('tt-cfg-spike-mode');
+    if (sm)  sm.value     = cfg.spikeMode || 'auto';
     const s   = document.getElementById('tt-cfg-spike');
     if (s)   s.value     = cfg.spikeThreshold;
+    const sp  = document.getElementById('tt-cfg-spike-points');
+    if (sp)  sp.value    = cfg.minSpikePoints;
     const r   = document.getElementById('tt-cfg-rev');
     if (r)   r.value     = cfg.reversalTicks;
     const sb  = document.getElementById('tt-cfg-snapback');
