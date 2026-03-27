@@ -51,9 +51,9 @@ A Chrome extension that overlays a real-time trading assistant on [dtrader.deriv
 2. **Reversal confirmation** – if the next `reversalTicks` ticks move in the *opposite* direction, a signal is fired.  
    - Spike **up** then reversal ticks **down** → **SELL**  
    - Spike **down** then reversal ticks **up** → **BUY**  
-3. **Scoring** – after 3 more ticks the entry price is compared with the 3rd-tick price:  
-   - BUY: exit > entry → **WIN**, else **LOSS**  
-   - SELL: exit < entry → **WIN**, else **LOSS**
+3. **Scoring** – after 3 more ticks the entry price is compared with the 3rd-tick price using integer tick units (`Math.round(price / tickSize)`) to avoid floating-point noise:  
+   - BUY: exitTicks ≥ entryTicks → **WIN**, else **LOSS** (equality counts as WIN)  
+   - SELL: exitTicks ≤ entryTicks → **WIN**, else **LOSS** (equality counts as WIN)
 
 ---
 

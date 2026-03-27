@@ -30,6 +30,8 @@
     entryProfile:      'balanced',  // 'early' | 'balanced' | 'strict' – maps to chop/alignment/two-stage thresholds
     macdTrendEpsilon:  0.00005,     // dead-zone half-width for tick-MACD trend classification
     macdTrendLookback: 3,           // number of recent ticks used to check histogram direction
+    tickSize:          0.1,         // Step Index 100 minimum price movement (tick size)
+    equalCountsAsWin:  true,        // equality at expiry counts as WIN for both BUY and SELL
     // ── Classic spike settings (used when strategyMode === 'classic') ──────
     spikeMode:        'auto',  // 'auto' | 'percent' | 'points'
     spikeThreshold:   0.001,   // minimum % price-move considered a spike (permissive default for calibration)
@@ -793,6 +795,12 @@
     return { spikePct, spikeAbs, spikeMode: mode, candidate, rejectReason: null, fired: true };
   }
 
+  // Convert a price to integer tick units to avoid floating-point comparison noise.
+  // Example: toTickUnits(7984.70) with tickSize=0.1 → 79847
+  function toTickUnits (price) {
+    return Math.round(price / cfg.tickSize);
+  }
+
   function scorePendingSignals (currentPrice) {
     let changed = false;
 
@@ -802,11 +810,30 @@
       sig.ticksAfter.push(currentPrice);
 
       if (sig.ticksAfter.length >= 3) {
-        const entry  = sig.price;
-        const exit   = sig.ticksAfter[2];
-        const isWin  = sig.type === 'BUY' ? exit > entry : exit < entry;
-        sig.result   = isWin ? 'WIN' : 'LOSS';
+        const entry      = sig.price;
+        const exit       = sig.ticksAfter[2];
+        const entryTicks = toTickUnits(entry);
+        const exitTicks  = toTickUnits(exit);
+        const equalityCountsAsWin = cfg.equalCountsAsWin !== false; // default true
+        let isWin;
+        let comparator;
+        if (sig.type === 'BUY') {
+          isWin      = equalityCountsAsWin ? exitTicks >= entryTicks : exitTicks > entryTicks;
+          comparator = equalityCountsAsWin ? '>=' : '>';
+        } else {
+          isWin      = equalityCountsAsWin ? exitTicks <= entryTicks : exitTicks < entryTicks;
+          comparator = equalityCountsAsWin ? '<=' : '<';
+        }
+        sig.result     = isWin ? 'WIN' : 'LOSS';
         sig.priceAfter = exit;
+        if (cfg.debugSignals) {
+          console.log(
+            '[3Tick][settle] side=' + sig.type +
+            ' entryPrice=' + entry + ' exitPrice=' + exit +
+            ' entryTicks=' + entryTicks + ' exitTicks=' + exitTicks +
+            ' comparator=' + comparator + ' result=' + sig.result
+          );
+        }
         if (isWin) { wins++;   updateWinsLossesUI(); }
         else       { losses++; updateWinsLossesUI(); }
         changed = true;
