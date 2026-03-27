@@ -15,7 +15,10 @@
   const SR_COUNT        = 3;     // how many R and S levels to show
   const RECONNECT_BASE  = 4000;  // ms – initial reconnect delay
   const RECONNECT_MAX   = 64000; // ms – reconnect delay cap
-  const TICK_LOG_MAX    = 5000;  // maximum in-memory tick log rows
+  const TICK_LOG_MAX          = 5000;  // maximum in-memory tick log rows
+  const WATCHDOG_INTERVAL     = 5000;  // ms – watchdog check frequency
+  const WATCHDOG_TICK_TIMEOUT = 25000; // ms – connected but no tick → re-subscribe
+  const WATCHDOG_EVAL_TIMEOUT = 30000; // ms – ticks arriving but eval stalled → reset eval state
 
   let cfg = {
     // ── Strategy mode ──────────────────────────────────────────────────────
@@ -24,6 +27,8 @@
     minIndicatorScore: 3,           // minimum combined indicator score to fire a signal (2–5)
     sameSideCooldownTicks: 5,       // minimum ticks before allowing another entry in the same direction
     chopHistThreshold: 0.0002,      // MACD histogram magnitude below which market is considered choppy
+    macdTrendEpsilon:  0.00005,     // dead-zone half-width for tick-MACD trend classification
+    macdTrendLookback: 3,           // number of recent ticks used to check histogram direction
     // ── Classic spike settings (used when strategyMode === 'classic') ──────
     spikeMode:        'auto',  // 'auto' | 'percent' | 'points'
     spikeThreshold:   0.001,   // minimum % price-move considered a spike (permissive default for calibration)
@@ -45,6 +50,10 @@
   let lastSignalTickIndex     = -999; // tick buffer index of last fired signal (cooldown tracking)
   let lastSignalSide          = null; // 'BUY' | 'SELL' | null – for same-side cooldown
   let lastSignalSideTickIndex = -999; // tick buffer index of last same-side signal
+
+  let lastTickProcessedAt  = 0;    // Date.now() of last tick received (for watchdog)
+  let lastSignalEvalAt     = 0;    // Date.now() of last successful detectSignal() call (for watchdog)
+  let watchdogInterval     = null; // setInterval handle for the watchdog
 
   let tickLog     = [];    // in-memory tick log rows for diagnostics
   let tickLogging = false; // true when user has started tick logging
@@ -84,7 +93,7 @@
           <span class="tt-val" id="tt-price">–</span>
         </div>
         <div class="tt-row">
-          <span class="tt-label">1m Trend</span>
+          <span class="tt-label">Trend</span>
           <span class="tt-val" id="tt-trend">–</span>
         </div>
         <div class="tt-row">
@@ -120,6 +129,18 @@
             <div class="tt-config-row">
               <label>Min indicator score (2–5)</label>
               <input type="number" id="tt-cfg-min-score" min="2" max="5" step="1" value="3">
+            </div>
+            <div class="tt-config-row">
+              <label>Trend source</label>
+              <span class="tt-val" style="font-size:11px;color:#7ec8e3;">tick_macd</span>
+            </div>
+            <div class="tt-config-row">
+              <label>MACD trend epsilon</label>
+              <input type="number" id="tt-cfg-macd-epsilon" min="0" max="0.01" step="0.00001" value="0.00005">
+            </div>
+            <div class="tt-config-row">
+              <label>MACD trend lookback</label>
+              <input type="number" id="tt-cfg-macd-lookback" min="2" max="10" step="1" value="3">
             </div>
           </div>
           <div id="tt-classic-controls">
@@ -266,6 +287,24 @@
       cfg.minIndicatorScore = (!isNaN(v) && v >= 2 && v <= 5) ? v : 3;
       saveCfg();
     });
+
+    const macdEpsilonEl = document.getElementById('tt-cfg-macd-epsilon');
+    if (macdEpsilonEl) {
+      macdEpsilonEl.addEventListener('change', function () {
+        const v = parseFloat(this.value);
+        cfg.macdTrendEpsilon = (!isNaN(v) && v >= 0) ? v : 0.00005;
+        saveCfg();
+      });
+    }
+
+    const macdLookbackEl = document.getElementById('tt-cfg-macd-lookback');
+    if (macdLookbackEl) {
+      macdLookbackEl.addEventListener('change', function () {
+        const v = parseInt(this.value, 10);
+        cfg.macdTrendLookback = (!isNaN(v) && v >= 2) ? v : 3;
+        saveCfg();
+      });
+    }
 
     // ── Classic spike controls ───────────────────────────────────────────
     document.getElementById('tt-cfg-spike-mode').addEventListener('change', function () {
@@ -477,12 +516,23 @@
     ticks.push({ price, time });
     if (ticks.length > TICK_BUF) ticks.shift();
 
+    lastTickProcessedAt = Date.now(); // watchdog: record last tick arrival time
+
     // Update last-price display
     const priceEl = document.getElementById('tt-price');
     if (priceEl) priceEl.textContent = price.toFixed(2);
 
-    // Check for new signal
-    const detection = detectSignal();
+    // Check for new signal – wrapped in try/catch to prevent stalls on errors
+    let detection = null;
+    try {
+      detection = detectSignal();
+      lastSignalEvalAt = Date.now(); // watchdog: eval completed successfully
+    } catch (e) {
+      console.error('[3Tick][handleTick] eval error (skipping tick)', e);
+    }
+
+    // Update tick-MACD trend display
+    updateTickMacdTrendUI();
 
     // Append to tick log when logging is active
     if (tickLogging) {
@@ -506,6 +556,24 @@
               ? 'accepted:' + detection.candidate
               : 'rejected:' + (detection.rejectReason || ''))
           : '',
+        // tick-MACD observability fields (NaN → '' in CSV; NaN means warmup/insufficient data)
+        trend_source: isIndicatorMode ? 'tick_macd' : 'classic',
+        macd_line:    (function () {
+          if (!isIndicatorMode || !detection) return '';
+          var v = detection.macdLine;
+          return (v != null && !isNaN(v)) ? (+v).toFixed(6) : '';
+        }()),
+        macd_signal:  (function () {
+          if (!isIndicatorMode || !detection) return '';
+          var v = detection.macdSignal;
+          return (v != null && !isNaN(v)) ? (+v).toFixed(6) : '';
+        }()),
+        macd_hist:    (function () {
+          if (!isIndicatorMode || !detection) return '';
+          var v = detection.macdHist;
+          return (v != null && !isNaN(v)) ? (+v).toFixed(6) : '';
+        }()),
+        macd_trend:   (isIndicatorMode && detection && detection.macdTrend) ? detection.macdTrend : '',
         // classic-mode fields
         spike_pct:        (!isIndicatorMode && detection && typeof detection.spikePct === 'number')
                             ? detection.spikePct.toFixed(5) : '',
@@ -980,6 +1048,82 @@
     return 'flat';
   }
 
+  // Derive short-term trend from tick-level MACD(12,26,9)
+  // Uses tick prices as the input series (not 1m candles) for finer resolution.
+  // Returns { trend: 'up'|'down'|'flat', macdLine, signalLine, hist }
+  function deriveTickMacdTrend () {
+    const tickPrices = ticks.map(function (t) { return t.price; });
+    const epsilon    = (cfg.macdTrendEpsilon  != null) ? cfg.macdTrendEpsilon  : 0.00005;
+    const lookback   = (cfg.macdTrendLookback != null) ? cfg.macdTrendLookback : 3;
+
+    // Need at least 26 (slow EMA) + 9 (signal EMA warmup) + lookback ticks
+    if (tickPrices.length < 35) {
+      return { trend: 'flat', macdLine: NaN, signalLine: NaN, hist: NaN };
+    }
+
+    const ema12arr = calcEMA(12, tickPrices);
+    const ema26arr = calcEMA(26, tickPrices);
+    const macdArr  = [];
+    for (let i = 0; i < tickPrices.length; i++) {
+      const v12 = ema12arr[i], v26 = ema26arr[i];
+      macdArr.push((isNaN(v12) || isNaN(v26)) ? NaN : v12 - v26);
+    }
+
+    const validMacd = macdArr.filter(function (v) { return !isNaN(v); });
+    if (validMacd.length < 9) {
+      return { trend: 'flat', macdLine: NaN, signalLine: NaN, hist: NaN };
+    }
+
+    const sigArr = calcEMA(9, validMacd);
+    const n = validMacd.length;
+
+    const macdLine   = validMacd[n - 1];
+    const signalLine = sigArr[n - 1];
+
+    if (isNaN(signalLine) || !isFinite(macdLine) || !isFinite(signalLine)) {
+      return { trend: 'flat', macdLine: NaN, signalLine: NaN, hist: NaN };
+    }
+
+    const hist = macdLine - signalLine;
+
+    // Collect recent histogram values over the lookback window for direction check
+    const recentHist = [];
+    for (let i = Math.max(0, n - lookback); i < n; i++) {
+      const sl = sigArr[i];
+      if (!isNaN(sl) && isFinite(sl)) recentHist.push(validMacd[i] - sl);
+    }
+    const histRising  = recentHist.length >= 2 &&
+                        recentHist[recentHist.length - 1] > recentHist[0];
+    const histFalling = recentHist.length >= 2 &&
+                        recentHist[recentHist.length - 1] < recentHist[0];
+
+    // Classify trend with hysteresis dead-zone around zero.
+    // Two-stage: prefer confirmation from both MACD position AND histogram direction;
+    // fall back to MACD position only when histogram direction is ambiguous.
+    let trend;
+    if      (macdLine > signalLine + epsilon && histRising)  { trend = 'up';   }
+    else if (macdLine < signalLine - epsilon && histFalling) { trend = 'down'; }
+    else if (Math.abs(hist) <= epsilon)                      { trend = 'flat'; } // dead-zone: treat as flat
+    else if (macdLine > signalLine + epsilon)                { trend = 'up';   } // directional fallback (no hist confirmation)
+    else if (macdLine < signalLine - epsilon)                { trend = 'down'; } // directional fallback
+    else                                                     { trend = 'flat'; }
+
+    return { trend, macdLine, signalLine, hist };
+  }
+
+  // Update the Trend display using tick-level MACD (called from handleTick)
+  function updateTickMacdTrendUI () {
+    if ((cfg.strategyMode || 'indicator') !== 'indicator') return; // classic mode uses candle-based updateTrend
+    const el = document.getElementById('tt-trend');
+    if (!el) return;
+    const r = deriveTickMacdTrend();
+    if (isNaN(r.macdLine)) { el.textContent = '– (warm)'; el.className = 'tt-val'; return; }
+    const histStr = isFinite(r.hist) ? ' h:' + r.hist.toFixed(5) : '';
+    if (r.trend === 'up')   { el.textContent = '▲ Up'   + histStr; el.className = 'tt-val tt-trend-up';   }
+    else if (r.trend === 'down') { el.textContent = '▼ Down' + histStr; el.className = 'tt-val tt-trend-down'; }
+    else                    { el.textContent = '↔ Side' + histStr; el.className = 'tt-val tt-trend-side'; }
+  }
+
   // Score all five indicators for current market state
   // Returns { buyScore, sellScore, buyComponents, sellComponents, ...rawIndicators }
   function scoreIndicators () {
@@ -1050,7 +1194,17 @@
     const preset   = cfg.indicatorPreset || 'balanced';
     const requiredMargin = preset === 'conservative' ? 2 : 1;
 
-    const baseResult = { buyScore, sellScore, buyComponents, sellComponents };
+    // Derive trend from tick-level MACD (primary trend gate)
+    const tickMacd = deriveTickMacdTrend();
+    const trend    = tickMacd.trend;
+
+    const baseResult = {
+      buyScore, sellScore, buyComponents, sellComponents,
+      macdLine:   tickMacd.macdLine,
+      macdSignal: tickMacd.signalLine,
+      macdHist:   tickMacd.hist,
+      macdTrend:  trend,
+    };
 
     // 1. Tie / ambiguous – never default to BUY
     if (buyScore === sellScore) {
@@ -1079,20 +1233,19 @@
       return Object.assign(baseResult, { candidate: null, rejectReason: 'score_margin', fired: false });
     }
 
-    // 5. Hard trend gate
-    const trend = deriveTrend();
+    // 5. Hard trend gate (tick-MACD trend)
     if (trend === 'down' && candidate === 'BUY') {
       // Allow strong counter-trend BUY only if margin >= 2 and RSI/Stoch turning
       const strongCounterTrend = (buyScore >= sellScore + 2) && rsi && rsi.rising && rsi.value < 45; // RSI below oversold threshold
       if (!strongCounterTrend) {
-        if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: trend_block_buy (trend=down, buy=' + buyScore + ' sell=' + sellScore + ')');
+        if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: trend_block_buy (tick_macd trend=down, buy=' + buyScore + ' sell=' + sellScore + ' macdLine=' + (isFinite(tickMacd.macdLine) ? tickMacd.macdLine.toFixed(6) : 'n/a') + ')');
         return Object.assign(baseResult, { candidate: null, rejectReason: 'trend_block_buy', fired: false });
       }
     }
     if (trend === 'up' && candidate === 'SELL') {
       const strongCounterTrend = (sellScore >= buyScore + 2) && rsi && !rsi.rising && rsi.value > 55; // RSI above overbought threshold
       if (!strongCounterTrend) {
-        if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: trend_block_sell (trend=up, buy=' + buyScore + ' sell=' + sellScore + ')');
+        if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: trend_block_sell (tick_macd trend=up, buy=' + buyScore + ' sell=' + sellScore + ' macdLine=' + (isFinite(tickMacd.macdLine) ? tickMacd.macdLine.toFixed(6) : 'n/a') + ')');
         return Object.assign(baseResult, { candidate: null, rejectReason: 'trend_block_sell', fired: false });
       }
     }
@@ -1101,7 +1254,7 @@
       const flatMinScore = minScore + 1;
       const flatMargin   = 2;
       if (score < flatMinScore || (score - loserScore) < flatMargin) {
-        if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: score_margin (flat trend, need score>=' + flatMinScore + ' margin>=' + flatMargin + ')');
+        if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: score_margin (tick_macd flat trend, need score>=' + flatMinScore + ' margin>=' + flatMargin + ')');
         return Object.assign(baseResult, { candidate: null, rejectReason: 'score_margin', fired: false });
       }
     }
@@ -1148,7 +1301,7 @@
     signals.push(sig);
     if (signals.length > 50) signals.shift();
 
-    if (cfg.debugSignals) console.log('[3Tick][indicator] ACCEPTED ' + candidate + ' score=' + score + ' (' + components + ') trend=' + trend + ' at price ' + sigPrice + ' time ' + sigTime);
+    if (cfg.debugSignals) console.log('[3Tick][indicator] ACCEPTED ' + candidate + ' score=' + score + ' (' + components + ') tick_macd_trend=' + trend + ' macdLine=' + (isFinite(tickMacd.macdLine) ? tickMacd.macdLine.toFixed(6) : 'n/a') + ' hist=' + (isFinite(tickMacd.hist) ? tickMacd.hist.toFixed(6) : 'n/a') + ' at price ' + sigPrice + ' time ' + sigTime);
 
     updateSignalsUI();
     return Object.assign(baseResult, { candidate, rejectReason: null, fired: true });
@@ -1225,7 +1378,7 @@
       showAlert('No tick log data to export. Start logging first.');
       return;
     }
-    const headers = ['epoch', 'iso_time', 'symbol', 'price', 'strategy_mode', 'buy_score', 'sell_score', 'score_components', 'indicator_reason', 'spike_pct', 'spike_points', 'spike_threshold_used', 'spike_mode_used', 'signal_candidate', 'reject_reason', 'signal_fired'];
+    const headers = ['epoch', 'iso_time', 'symbol', 'price', 'strategy_mode', 'buy_score', 'sell_score', 'score_components', 'indicator_reason', 'trend_source', 'macd_line', 'macd_signal', 'macd_hist', 'macd_trend', 'spike_pct', 'spike_points', 'spike_threshold_used', 'spike_mode_used', 'signal_candidate', 'reject_reason', 'signal_fired'];
     const rows = [headers].concat(tickLog.map(function (r) {
       return headers.map(function (h) { return r[h] !== undefined ? r[h] : ''; });
     }));
@@ -1256,6 +1409,8 @@
       minIndicatorScore: 3,
       sameSideCooldownTicks: 5,
       chopHistThreshold: 0.0002,
+      macdTrendEpsilon:  0.00005,
+      macdTrendLookback: 3,
       spikeMode:        'auto',
       spikeThreshold:   0.001,
       minSpikePoints:   0.1,
@@ -1311,7 +1466,77 @@
     if (vp)  vp.value    = cfg.minVolatilityPct;
     const dbg = document.getElementById('tt-cfg-debug');
     if (dbg) dbg.checked = cfg.debugSignals;
+    const macdEpsilonInputEl = document.getElementById('tt-cfg-macd-epsilon');
+    if (macdEpsilonInputEl) macdEpsilonInputEl.value = cfg.macdTrendEpsilon  != null ? cfg.macdTrendEpsilon  : 0.00005;
+    const macdLookbackInputEl = document.getElementById('tt-cfg-macd-lookback');
+    if (macdLookbackInputEl) macdLookbackInputEl.value = cfg.macdTrendLookback != null ? cfg.macdTrendLookback : 3;
     syncStrategyModeUI(cfg.strategyMode || 'indicator');
+  }
+
+  // ── Watchdog (freeze/stall recovery) ─────────────────────────────────────
+
+  // Re-send tick subscription on an open WS (idempotent; falls back to full reconnect)
+  function resubscribe () {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !resolvedSymbol) {
+      // WS not ready – trigger a fresh reconnect
+      if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+      scheduleReconnect();
+      return;
+    }
+    try {
+      ws.send(JSON.stringify({ ticks: resolvedSymbol, subscribe: 1 }));
+      console.log('[3Tick][watchdog] re-sent tick subscription for', resolvedSymbol);
+    } catch (e) {
+      console.error('[3Tick][watchdog] resubscribe send error', e);
+      if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+    }
+  }
+
+  // Reset signal-evaluator state without touching WS (safe partial recovery)
+  function resetEvalState () {
+    lastSignalTickIndex     = -999;
+    lastSignalSide          = null;
+    lastSignalSideTickIndex = -999;
+    console.log('[3Tick][watchdog] watchdog_recover_eval: eval state reset');
+  }
+
+  // Start (or restart) the watchdog timer; idempotent – clears any existing interval first
+  function startWatchdog () {
+    if (watchdogInterval) {
+      clearInterval(watchdogInterval);
+      watchdogInterval = null;
+    }
+    watchdogInterval = setInterval(function () {
+      try {
+        const now = Date.now();
+        if (wsState !== 'connected') return;
+
+        const tickAge = lastTickProcessedAt > 0 ? now - lastTickProcessedAt : -1;
+
+        // 1. Connected but no tick has arrived within threshold → re-subscribe
+        if (tickAge > WATCHDOG_TICK_TIMEOUT) {
+          const msg = 'watchdog_recover_ws: no tick for ' + tickAge + 'ms, re-subscribing';
+          console.warn('[3Tick][watchdog]', msg);
+          if (cfg.debugSignals) showAlert('Watchdog: re-subscribing (' + Math.round(tickAge / 1000) + 's idle)');
+          lastTickProcessedAt = now; // prevent repeated triggers on same stall
+          resubscribe();
+          return;
+        }
+
+        // 2. Ticks arriving but eval not running → reset eval state
+        // Note: WATCHDOG_EVAL_TIMEOUT > WATCHDOG_TICK_TIMEOUT so both conditions cannot
+        // fire simultaneously; eval reset (30s) only triggers when WS is healthy (<25s).
+        if (tickAge >= 0 && tickAge < WATCHDOG_TICK_TIMEOUT &&
+            lastSignalEvalAt > 0 && (now - lastSignalEvalAt) > WATCHDOG_EVAL_TIMEOUT) {
+          const evalAge = now - lastSignalEvalAt;
+          console.warn('[3Tick][watchdog] watchdog_recover_eval: eval stalled for ' + evalAge + 'ms');
+          resetEvalState();
+          lastSignalEvalAt = now;
+        }
+      } catch (e) {
+        console.error('[3Tick][watchdog] watchdog timer error', e);
+      }
+    }, WATCHDOG_INTERVAL);
   }
 
   // ── Init ──────────────────────────────────────────────────────────────────
@@ -1320,6 +1545,7 @@
     cfg = loadCfg();
     buildOverlay();
     connect();
+    startWatchdog(); // idempotent – safe to call on every init
   }
 
   // Wait until the page body is available, then inject
