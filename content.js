@@ -31,6 +31,7 @@
     minIndicatorScore: 3,           // minimum combined indicator score to fire a signal (2–5)
     sameSideCooldownTicks: 5,       // minimum ticks before allowing another entry in the same direction
     chopHistThreshold: 0.0002,      // MACD histogram magnitude below which market is considered choppy
+    nearZeroHistThreshold: 0.01,    // |hist| <= this → near-zero transition zone; requires alignMin+1 before entry
     entryProfile:      'balanced',  // 'early' | 'balanced' | 'strict' – maps to chop/alignment/two-stage thresholds
     macdTrendEpsilon:  0.00005,     // dead-zone half-width for tick-MACD trend classification
     macdTrendLookback: 3,           // number of recent ticks used to check histogram direction
@@ -1532,12 +1533,19 @@
     const alignScores  = calcAlignmentScores(tickMacd, ind, currentPrice, closes);
     const { buyAlignment, sellAlignment } = alignScores;
     const alignScore = candidate === 'BUY' ? buyAlignment : sellAlignment;
-    if (alignScore < thresholds.alignMin) {
-      if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: alignment_insufficient ' + candidate + ' align=' + alignScore + ' need>=' + thresholds.alignMin + ' profile=' + (cfg.entryProfile || 'balanced'));
+
+    // Near-zero histogram guard: require +1 alignment when MACD hist is near zero (transition zone).
+    const isNearZeroHist = Math.abs(tickMacd.hist) <= cfg.nearZeroHistThreshold;
+    const effectiveAlignMin = isNearZeroHist ? thresholds.alignMin + 1 : thresholds.alignMin;
+
+    if (alignScore < effectiveAlignMin) {
+      const rejectReason = isNearZeroHist ? 'alignment_insufficient_near_zero' : 'alignment_insufficient';
+      if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: ' + rejectReason + ' ' + candidate + ' align=' + alignScore + ' need>=' + effectiveAlignMin + ' is_near_zero_hist=' + isNearZeroHist + ' effective_align_min=' + effectiveAlignMin + ' profile=' + (cfg.entryProfile || 'balanced'));
       return Object.assign(baseResult, {
-        candidate, rejectReason: 'alignment_insufficient', fired: false,
+        candidate, rejectReason, fired: false,
         chopScore: chopResult.chopScore, alignmentScoreBuy: buyAlignment, alignmentScoreSell: sellAlignment,
-        entryReason: 'alignment_insufficient',
+        entryReason: rejectReason,
+        ...(cfg.debugSignals ? { is_near_zero_hist: isNearZeroHist, effective_align_min: effectiveAlignMin } : {}),
       });
     }
 
