@@ -15,10 +15,13 @@
   const SR_COUNT        = 3;     // how many R and S levels to show
   const RECONNECT_BASE  = 4000;  // ms – initial reconnect delay
   const RECONNECT_MAX   = 64000; // ms – reconnect delay cap
-  const TICK_LOG_MAX          = 5000;  // maximum in-memory tick log rows
-  const WATCHDOG_INTERVAL     = 5000;  // ms – watchdog check frequency
-  const WATCHDOG_TICK_TIMEOUT = 25000; // ms – connected but no tick → re-subscribe
-  const WATCHDOG_EVAL_TIMEOUT = 30000; // ms – ticks arriving but eval stalled → reset eval state
+  const TICK_LOG_MAX           = 5000;  // maximum in-memory tick log rows
+  const WATCHDOG_INTERVAL      = 5000;  // ms – watchdog check frequency
+  const WATCHDOG_TICK_TIMEOUT  = 25000; // ms – connected but no tick → re-subscribe (stage 1)
+  const WATCHDOG_EVAL_TIMEOUT  = 20000; // ms – ticks arriving but eval stalled → reset eval state
+  const WATCHDOG_SETUP_STALE_MS = 20000; // ms – pending setup older than this is considered stuck
+  const WATCHDOG_RESUB_GRACE    = 3;    // multiplier: resub window = WATCHDOG_TICK_TIMEOUT * this
+  const WATCHDOG_RESUB_GRACE_MS = WATCHDOG_TICK_TIMEOUT * WATCHDOG_RESUB_GRACE; // escalation window before reconnect
 
   let cfg = {
     // ── Strategy mode ──────────────────────────────────────────────────────
@@ -50,14 +53,19 @@
   let signals     = [];  // { type, price, time, result, ticksAfter, priceAfter }
   let wins        = 0;
   let losses      = 0;
-  let lastSignalTickIndex     = -999; // tick buffer index of last fired signal (cooldown tracking)
+  let tickSeq                 = 0;    // monotonic tick sequence (never shrinks when tick buffer shifts)
+  let lastSignalTickIndex     = -999; // tick sequence index of last fired signal (cooldown tracking)
   let lastSignalSide          = null; // 'BUY' | 'SELL' | null – for same-side cooldown
-  let lastSignalSideTickIndex = -999; // tick buffer index of last same-side signal
-  let pendingSetup            = null; // { side: 'BUY'|'SELL', tickIndex, hist } – two-stage entry confirmation
+  let lastSignalSideTickIndex = -999; // tick sequence index of last same-side signal
+  let pendingSetup            = null; // { side: 'BUY'|'SELL', tickIndex, hist, createdAt } where tickIndex is monotonic tickSeq
 
   let lastTickProcessedAt  = 0;    // Date.now() of last tick received (for watchdog)
   let lastSignalEvalAt     = 0;    // Date.now() of last successful detectSignal() call (for watchdog)
   let watchdogInterval     = null; // setInterval handle for the watchdog
+  let evalErrorCount       = 0;    // cumulative count of detectSignal() exceptions (watchdog observability)
+  let lastSignalFiredAt    = 0;    // Date.now() of last successfully fired signal (watchdog observability)
+  let watchdogLastResubAt  = 0;    // Date.now() of last watchdog resubscribe action (two-stage recovery)
+  let lastWatchdogEvent    = '';   // last watchdog recovery action name; consumed by next tick log entry
 
   let tickLog     = [];    // in-memory tick log rows for diagnostics
   let tickLogging = false; // true when user has started tick logging
@@ -438,6 +446,9 @@
       reconnectDelay = RECONNECT_BASE; // reset backoff on successful connection
       failCount     = 0;
       usingFallback = false;
+      // Reset watchdog clocks from connection time so stale-tick detection starts immediately
+      lastTickProcessedAt = Date.now();
+      lastSignalEvalAt    = Date.now();
       // Discover the correct symbol before subscribing
       ws.send(JSON.stringify({ active_symbols: 'brief', product_type: 'basic' }));
     });
@@ -532,6 +543,7 @@
     if (!tick || tick.symbol !== resolvedSymbol) return;
     const price = parseFloat(tick.quote);
     const time  = tick.epoch;
+    tickSeq++;
 
     ticks.push({ price, time });
     if (ticks.length > TICK_BUF) ticks.shift();
@@ -548,7 +560,8 @@
       detection = detectSignal();
       lastSignalEvalAt = Date.now(); // watchdog: eval completed successfully
     } catch (e) {
-      console.error('[3Tick][handleTick] eval error (skipping tick)', e);
+      evalErrorCount++;
+      console.error('[3Tick][handleTick] eval error #' + evalErrorCount + ' (skipping tick)', e);
     }
 
     // Update tick-MACD trend display
@@ -557,6 +570,9 @@
     // Append to tick log when logging is active
     if (tickLogging) {
       const isIndicatorMode = (cfg.strategyMode || 'indicator') === 'indicator';
+      // Consume watchdog event so only one tick log entry carries each event name
+      const wdEvent = lastWatchdogEvent;
+      lastWatchdogEvent = '';
       const row = {
         epoch:            time,
         iso_time:         new Date(time * 1000).toISOString(),
@@ -617,6 +633,12 @@
         signal_candidate: (detection && detection.candidate) ? detection.candidate : '',
         reject_reason:    (detection && detection.rejectReason) ? detection.rejectReason : '',
         signal_fired:     detection ? detection.fired : false,
+        // watchdog observability fields (appended; do not break existing CSV columns)
+        watchdog_event:   wdEvent,
+        ws_state:         wsState,
+        tick_age_ms:      Math.max(0, Date.now() - (time * 1000)),
+        eval_age_ms:      lastSignalEvalAt > 0 ? Date.now() - lastSignalEvalAt : '',
+        eval_error_count: evalErrorCount,
       };
       tickLog.push(row);
       if (tickLog.length > TICK_LOG_MAX) tickLog.shift();
@@ -768,7 +790,8 @@
     }
 
     // ── Gate 4: Cooldown ──────────────────────────────────────────────────
-    const ticksSinceLast = (n - 1) - lastSignalTickIndex;
+    const currentTickIndex = tickSeq;
+    const ticksSinceLast = currentTickIndex - lastSignalTickIndex;
     if (ticksSinceLast < cfg.cooldownTicks) {
       if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: cooldown (${ticksSinceLast} ticks since last, need ${cfg.cooldownTicks})`);
       return { spikePct, candidate, rejectReason: 'cooldown', fired: false };
@@ -783,7 +806,7 @@
       return { spikePct, candidate, rejectReason: 'duplicate', fired: false };
     }
 
-    lastSignalTickIndex = n - 1;
+    lastSignalTickIndex = currentTickIndex;
 
     const sig = { type: sigType, price: sigPrice, time: sigTime, result: 'PENDING', ticksAfter: [] };
     signals.push(sig);
@@ -791,6 +814,7 @@
 
     if (cfg.debugSignals) console.log(`[3Tick][signal] ACCEPTED ${sigType} at price ${sigPrice} time ${sigTime}`);
 
+    lastSignalFiredAt = Date.now(); // watchdog: track last fired signal
     updateSignalsUI();
     return { spikePct, spikeAbs, spikeMode: mode, candidate, rejectReason: null, fired: true };
   }
@@ -1469,7 +1493,8 @@
     }
 
     // 7. Global cooldown guard
-    const ticksSinceLast = (n - 1) - lastSignalTickIndex;
+    const currentTickIndex = tickSeq;
+    const ticksSinceLast = currentTickIndex - lastSignalTickIndex;
     if (ticksSinceLast < cfg.cooldownTicks) {
       if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: cooldown (' + ticksSinceLast + ' ticks since last, need ' + cfg.cooldownTicks + ')');
       return Object.assign(baseResult, { candidate, rejectReason: 'cooldown', fired: false });
@@ -1478,7 +1503,7 @@
     // 8. Same-side cooldown guard
     const sameSideCooldown = cfg.sameSideCooldownTicks != null ? cfg.sameSideCooldownTicks : 5;
     if (lastSignalSide === candidate) {
-      const ticksSinceLastSameSide = (n - 1) - lastSignalSideTickIndex;
+      const ticksSinceLastSameSide = currentTickIndex - lastSignalSideTickIndex;
       if (ticksSinceLastSameSide < sameSideCooldown) {
         if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: same_side_cooldown (' + candidate + ' ' + ticksSinceLastSameSide + ' ticks since last, need ' + sameSideCooldown + ')');
         return Object.assign(baseResult, { candidate, rejectReason: 'same_side_cooldown', fired: false });
@@ -1516,10 +1541,10 @@
     // 11. Two-stage setup → trigger confirmation (balanced/strict profiles only)
     if (thresholds.twoStage) {
       if (pendingSetup && pendingSetup.side === candidate) {
-        const ticksSinceSetup = (n - 1) - pendingSetup.tickIndex;
+        const ticksSinceSetup = currentTickIndex - pendingSetup.tickIndex;
         if (ticksSinceSetup > thresholds.setupTimeoutTicks) {
           // Setup expired – restart with this tick as new setup
-          pendingSetup = { side: candidate, tickIndex: n - 1, hist: tickMacd.hist };
+          pendingSetup = { side: candidate, tickIndex: currentTickIndex, hist: tickMacd.hist, createdAt: Date.now() };
           if (cfg.debugSignals) console.log('[3Tick][indicator] setup_timeout for ' + candidate + ', restarting setup');
           return Object.assign(baseResult, {
             candidate, rejectReason: 'setup_timeout', fired: false,
@@ -1546,8 +1571,8 @@
         if (pendingSetup && pendingSetup.side !== candidate) {
           if (cfg.debugSignals) console.log('[3Tick][indicator] setup_side_flip: discarding ' + pendingSetup.side + ' setup, starting ' + candidate + ' setup');
         }
-        pendingSetup = { side: candidate, tickIndex: n - 1, hist: tickMacd.hist };
-        if (cfg.debugSignals) console.log('[3Tick][indicator] setup_pending for ' + candidate + ' at tick ' + (n - 1));
+        pendingSetup = { side: candidate, tickIndex: currentTickIndex, hist: tickMacd.hist, createdAt: Date.now() };
+        if (cfg.debugSignals) console.log('[3Tick][indicator] setup_pending for ' + candidate + ' at tick_seq ' + currentTickIndex);
         return Object.assign(baseResult, {
           candidate, rejectReason: 'setup_pending', fired: false,
           chopScore: chopResult.chopScore, alignmentScoreBuy: buyAlignment, alignmentScoreSell: sellAlignment,
@@ -1564,9 +1589,9 @@
       return Object.assign(baseResult, { candidate, rejectReason: 'duplicate', fired: false });
     }
 
-    lastSignalTickIndex     = n - 1;
+    lastSignalTickIndex     = currentTickIndex;
     lastSignalSide          = candidate;
-    lastSignalSideTickIndex = n - 1;
+    lastSignalSideTickIndex = currentTickIndex;
 
     const sig = { type: candidate, price: sigPrice, time: sigTime, result: 'PENDING', ticksAfter: [] };
     signals.push(sig);
@@ -1574,6 +1599,7 @@
 
     if (cfg.debugSignals) console.log('[3Tick][indicator] ACCEPTED ' + candidate + ' score=' + score + ' (' + components + ') align=' + alignScore + ' chop=' + chopResult.chopScore + ' tick_macd_trend=' + trend + ' macdLine=' + (isFinite(tickMacd.macdLine) ? tickMacd.macdLine.toFixed(6) : 'n/a') + ' hist=' + (isFinite(tickMacd.hist) ? tickMacd.hist.toFixed(6) : 'n/a') + ' profile=' + (cfg.entryProfile || 'balanced') + ' at price ' + sigPrice + ' time ' + sigTime);
 
+    lastSignalFiredAt = Date.now(); // watchdog: track last fired signal
     updateSignalsUI();
     return Object.assign(baseResult, {
       candidate, rejectReason: null, fired: true,
@@ -1653,7 +1679,7 @@
       showAlert('No tick log data to export. Start logging first.');
       return;
     }
-    const headers = ['epoch', 'iso_time', 'symbol', 'price', 'strategy_mode', 'buy_score', 'sell_score', 'score_components', 'indicator_reason', 'trend_source', 'macd_line', 'macd_signal', 'macd_hist', 'macd_trend', 'entry_profile', 'chop_score', 'alignment_score_buy', 'alignment_score_sell', 'setup_state', 'entry_reason', 'spike_pct', 'spike_points', 'spike_threshold_used', 'spike_mode_used', 'signal_candidate', 'reject_reason', 'signal_fired'];
+    const headers = ['epoch', 'iso_time', 'symbol', 'price', 'strategy_mode', 'buy_score', 'sell_score', 'score_components', 'indicator_reason', 'trend_source', 'macd_line', 'macd_signal', 'macd_hist', 'macd_trend', 'entry_profile', 'chop_score', 'alignment_score_buy', 'alignment_score_sell', 'setup_state', 'entry_reason', 'spike_pct', 'spike_points', 'spike_threshold_used', 'spike_mode_used', 'signal_candidate', 'reject_reason', 'signal_fired', 'watchdog_event', 'ws_state', 'tick_age_ms', 'eval_age_ms', 'eval_error_count'];
     const rows = [headers].concat(tickLog.map(function (r) {
       return headers.map(function (h) { return r[h] !== undefined ? r[h] : ''; });
     }));
@@ -1791,26 +1817,71 @@
         if (wsState !== 'connected') return;
 
         const tickAge = lastTickProcessedAt > 0 ? now - lastTickProcessedAt : -1;
+        const evalAge = lastSignalEvalAt    > 0 ? now - lastSignalEvalAt    : -1;
 
-        // 1. Connected but no tick has arrived within threshold → re-subscribe
-        if (tickAge > WATCHDOG_TICK_TIMEOUT) {
-          const msg = 'watchdog_recover_ws: no tick for ' + tickAge + 'ms, re-subscribing';
-          console.warn('[3Tick][watchdog]', msg);
-          if (cfg.debugSignals) showAlert('Watchdog: re-subscribing (' + Math.round(tickAge / 1000) + 's idle)');
-          lastTickProcessedAt = now; // prevent repeated triggers on same stall
-          resubscribe();
+        // Compact debug snapshot every watchdog cycle
+        if (cfg.debugSignals) {
+          console.log(
+            '[3Tick][watchdog] snap' +
+            ' ws=' + wsState +
+            ' ws_ready=' + (ws ? ws.readyState : 'null') +
+            ' tick_age=' + (tickAge >= 0 ? tickAge + 'ms' : 'never') +
+            ' eval_age=' + (evalAge >= 0 ? evalAge + 'ms' : 'never') +
+            ' eval_errors=' + evalErrorCount +
+            ' fired_ago=' + (lastSignalFiredAt > 0 ? (now - lastSignalFiredAt) + 'ms' : 'never') +
+            ' pending=' + (pendingSetup
+              ? pendingSetup.side + ' age=' + (pendingSetup.createdAt ? (now - pendingSetup.createdAt) + 'ms' : '?')
+              : 'none')
+          );
+        }
+
+        // 1. Connected but no tick within threshold → two-stage recovery
+        //    Stage 1: resubscribe; Stage 2 (next stale cycle): full reconnect
+        //    tickAge < 0 means lastTickProcessedAt is still 0 (no tick ever received on this session)
+        if (tickAge < 0 || tickAge > WATCHDOG_TICK_TIMEOUT) {
+          const resubRecently = watchdogLastResubAt > 0 &&
+                                (now - watchdogLastResubAt) < WATCHDOG_RESUB_GRACE_MS;
+          if (resubRecently) {
+            // Already resubscribed but still stale → escalate to full reconnect
+            console.warn('[3Tick][watchdog] watchdog_recover_reconnect: still no tick after resubscribe, reconnecting');
+            if (cfg.debugSignals) showAlert('Watchdog: reconnecting (stale after resub)');
+            lastWatchdogEvent   = 'watchdog_recover_reconnect';
+            watchdogLastResubAt = 0;
+            lastTickProcessedAt = now; // prevent rapid retrigger
+            lastSignalEvalAt    = now;
+            if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+            scheduleReconnect();
+          } else {
+            // First stale trigger → resubscribe
+            const ageStr = tickAge >= 0 ? tickAge + 'ms' : 'never';
+            console.warn('[3Tick][watchdog] watchdog_recover_resubscribe: no tick for ' + ageStr + ', re-subscribing');
+            if (cfg.debugSignals) showAlert('Watchdog: re-subscribing (tick stale ' + (tickAge >= 0 ? Math.round(tickAge / 1000) + 's' : 'n/a') + ')');
+            lastWatchdogEvent   = 'watchdog_recover_resubscribe';
+            watchdogLastResubAt = now;
+            lastTickProcessedAt = now; // prevent repeated triggers on same stall
+            resubscribe();
+          }
           return;
         }
 
-        // 2. Ticks arriving but eval not running → reset eval state
-        // Note: WATCHDOG_EVAL_TIMEOUT > WATCHDOG_TICK_TIMEOUT so both conditions cannot
-        // fire simultaneously; eval reset (30s) only triggers when WS is healthy (<25s).
-        if (tickAge >= 0 && tickAge < WATCHDOG_TICK_TIMEOUT &&
-            lastSignalEvalAt > 0 && (now - lastSignalEvalAt) > WATCHDOG_EVAL_TIMEOUT) {
-          const evalAge = now - lastSignalEvalAt;
+        // Ticks flowing normally – reset resubscribe tracker
+        watchdogLastResubAt = 0;
+
+        // 2. Ticks arriving but eval stalled → reset eval state only
+        if (evalAge > WATCHDOG_EVAL_TIMEOUT) {
           console.warn('[3Tick][watchdog] watchdog_recover_eval: eval stalled for ' + evalAge + 'ms');
+          lastWatchdogEvent = 'watchdog_recover_eval';
           resetEvalState();
           lastSignalEvalAt = now;
+        }
+
+        // 3. Pending setup stuck longer than stale threshold → clear it
+        if (pendingSetup && pendingSetup.createdAt &&
+            (now - pendingSetup.createdAt) > WATCHDOG_SETUP_STALE_MS) {
+          const staleMs = now - pendingSetup.createdAt;
+          console.warn('[3Tick][watchdog] watchdog_clear_stuck_setup: ' + pendingSetup.side + ' setup stale ' + staleMs + 'ms, clearing');
+          lastWatchdogEvent = 'watchdog_clear_stuck_setup';
+          pendingSetup = null;
         }
       } catch (e) {
         console.error('[3Tick][watchdog] watchdog timer error', e);
