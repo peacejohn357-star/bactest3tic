@@ -16,6 +16,7 @@
   const RECONNECT_BASE  = 4000;  // ms – initial reconnect delay
   const RECONNECT_MAX   = 64000; // ms – reconnect delay cap
   const TICK_LOG_MAX           = 5000;  // maximum in-memory tick log rows
+  const SESSION_HISTORY_CAP    = 5000;  // maximum full-session trade history for CSV export
   const WATCHDOG_INTERVAL      = 5000;  // ms – watchdog check frequency
   const WATCHDOG_TICK_TIMEOUT  = 25000; // ms – connected but no tick → re-subscribe (stage 1)
   const WATCHDOG_EVAL_TIMEOUT  = 20000; // ms – ticks arriving but eval stalled → reset eval state
@@ -50,7 +51,8 @@
   // ── State ─────────────────────────────────────────────────────────────────
   let ticks       = [];  // { price: number, time: number }
   let candles     = [];  // { open, high, low, close, time }
-  let signals     = [];  // { type, price, time, result, ticksAfter, priceAfter }
+  let signals     = [];  // { type, price, time, result, ticksAfter, priceAfter } – UI display (capped at 50)
+  let sessionTradesAll = []; // full session trade history for CSV export (capped at SESSION_HISTORY_CAP)
   let wins        = 0;
   let losses      = 0;
   let tickSeq                 = 0;    // monotonic tick sequence (never shrinks when tick buffer shifts)
@@ -811,6 +813,7 @@
     const sig = { type: sigType, price: sigPrice, time: sigTime, result: 'PENDING', ticksAfter: [] };
     signals.push(sig);
     if (signals.length > 50) signals.shift();
+    recordSessionTrade(sig);
 
     if (cfg.debugSignals) console.log(`[3Tick][signal] ACCEPTED ${sigType} at price ${sigPrice} time ${sigTime}`);
 
@@ -1596,6 +1599,7 @@
     const sig = { type: candidate, price: sigPrice, time: sigTime, result: 'PENDING', ticksAfter: [] };
     signals.push(sig);
     if (signals.length > 50) signals.shift();
+    recordSessionTrade(sig);
 
     if (cfg.debugSignals) console.log('[3Tick][indicator] ACCEPTED ' + candidate + ' score=' + score + ' (' + components + ') align=' + alignScore + ' chop=' + chopResult.chopScore + ' tick_macd_trend=' + trend + ' macdLine=' + (isFinite(tickMacd.macdLine) ? tickMacd.macdLine.toFixed(6) : 'n/a') + ' hist=' + (isFinite(tickMacd.hist) ? tickMacd.hist.toFixed(6) : 'n/a') + ' profile=' + (cfg.entryProfile || 'balanced') + ' at price ' + sigPrice + ' time ' + sigTime);
 
@@ -1651,10 +1655,16 @@
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   }
 
+  // ── Session trade history (full-run store for CSV export) ─────────────────
+  function recordSessionTrade (sig) {
+    sessionTradesAll.push(sig);
+    if (sessionTradesAll.length > SESSION_HISTORY_CAP) sessionTradesAll.shift();
+  }
+
   // ── CSV export ────────────────────────────────────────────────────────────
   function exportCSV () {
     const rows = [['Type', 'Entry Price', 'Time', 'Result', 'Exit Price']];
-    signals.forEach(function (s) {
+    sessionTradesAll.forEach(function (s) {
       rows.push([
         s.type,
         s.price.toFixed(2),
@@ -1663,6 +1673,7 @@
         s.priceAfter !== undefined ? s.priceAfter.toFixed(2) : '',
       ]);
     });
+    console.log('[3Tick][export] visibleCount=' + signals.length + ' fullHistoryCount=' + sessionTradesAll.length + ' exportedCount=' + (rows.length - 1));
     const csv  = rows.map(function (r) { return r.join(','); }).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const url  = URL.createObjectURL(blob);
