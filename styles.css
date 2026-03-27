@@ -223,6 +223,28 @@
   background: #2e3a5a;
 }
 
+/* ── Tick log buttons ── */
+#tt-log-toggle,
+#tt-log-export {
+  width: 100%;
+  margin-top: 2px;
+  padding: 5px 0;
+  background: #232a42;
+  border: 1px solid #3a4260;
+  color: #a0c8a0;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  transition: background 0.15s;
+}
+
+#tt-log-toggle:hover,
+#tt-log-export:hover {
+  background: #2e3a5a;
+}
+
 /* ── Config section ── */
 #tt-config {
   display: none;

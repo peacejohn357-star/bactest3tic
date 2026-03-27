@@ -15,6 +15,7 @@
   const SR_COUNT        = 3;     // how many R and S levels to show
   const RECONNECT_BASE  = 4000;  // ms – initial reconnect delay
   const RECONNECT_MAX   = 64000; // ms – reconnect delay cap
+  const TICK_LOG_MAX    = 5000;  // maximum in-memory tick log rows
 
   let cfg = {
     spikeThreshold:   0.30,  // minimum % price-move considered a spike
@@ -33,6 +34,9 @@
   let wins        = 0;
   let losses      = 0;
   let lastSignalTickIndex = -999; // tick buffer index of last fired signal (cooldown tracking)
+
+  let tickLog     = [];    // in-memory tick log rows for diagnostics
+  let tickLogging = false; // true when user has started tick logging
 
   let ws             = null;
   let wsState        = 'disconnected';
@@ -116,6 +120,8 @@
           </div>
         </div>
         <button id="tt-export">⬇ Export CSV</button>
+        <button id="tt-log-toggle">▶ Start tick log</button>
+        <button id="tt-log-export">⬇ Export tick log</button>
       </div>
       <div id="tt-alert"></div>
     `;
@@ -187,37 +193,60 @@
 
     document.getElementById('tt-cfg-spike').addEventListener('change', function () {
       cfg.spikeThreshold = parseFloat(this.value) || 0.30;
+      saveCfg();
     });
 
     document.getElementById('tt-cfg-rev').addEventListener('change', function () {
       cfg.reversalTicks = parseInt(this.value, 10) || 1;
+      saveCfg();
     });
 
     document.getElementById('tt-cfg-snapback').addEventListener('change', function () {
       const v = parseFloat(this.value);
       cfg.minSnapbackRatio = (!isNaN(v) && v >= 0) ? v : 0.5;
+      saveCfg();
     });
 
     document.getElementById('tt-cfg-lookback').addEventListener('change', function () {
       const v = parseInt(this.value, 10);
       cfg.extremeLookback = (!isNaN(v) && v >= 1) ? v : 10;
+      saveCfg();
     });
 
     document.getElementById('tt-cfg-cooldown').addEventListener('change', function () {
       const v = parseInt(this.value, 10);
       cfg.cooldownTicks = (!isNaN(v) && v >= 0) ? v : 2;
+      saveCfg();
     });
 
     document.getElementById('tt-cfg-volpct').addEventListener('change', function () {
       const v = parseFloat(this.value);
       cfg.minVolatilityPct = (!isNaN(v) && v >= 0) ? v : 0.03;
+      saveCfg();
     });
 
     document.getElementById('tt-cfg-debug').addEventListener('change', function () {
       cfg.debugSignals = this.checked;
+      saveCfg();
     });
 
     document.getElementById('tt-export').addEventListener('click', exportCSV);
+
+    const logToggleBtn = document.getElementById('tt-log-toggle');
+    if (logToggleBtn) {
+      logToggleBtn.addEventListener('click', function () {
+        tickLogging = !tickLogging;
+        if (tickLogging) tickLog = []; // clear log on each new start
+        this.textContent = tickLogging ? '⏹ Stop tick log' : '▶ Start tick log';
+      });
+    }
+
+    const logExportBtn = document.getElementById('tt-log-export');
+    if (logExportBtn) {
+      logExportBtn.addEventListener('click', exportTickLog);
+    }
+
+    applyConfigToUI();
   }
 
   // ── WebSocket ─────────────────────────────────────────────────────────────
@@ -365,7 +394,24 @@
     if (priceEl) priceEl.textContent = price.toFixed(2);
 
     // Check for new signal
-    detectSignal();
+    const detection = detectSignal();
+
+    // Append to tick log when logging is active
+    if (tickLogging) {
+      const row = {
+        epoch:            time,
+        iso_time:         new Date(time * 1000).toISOString(),
+        symbol:           resolvedSymbol || '',
+        price:            price,
+        spike_pct:        (detection && typeof detection.spikePct === 'number')
+                            ? detection.spikePct.toFixed(5) : '',
+        signal_candidate: (detection && detection.candidate) ? detection.candidate : '',
+        reject_reason:    (detection && detection.rejectReason) ? detection.rejectReason : '',
+        signal_fired:     detection ? detection.fired : false,
+      };
+      tickLog.push(row);
+      if (tickLog.length > TICK_LOG_MAX) tickLog.shift();
+    }
 
     // Score pending signals
     scorePendingSignals(price);
@@ -415,20 +461,21 @@
    */
   function detectSignal () {
     const n = ticks.length;
-    if (n < cfg.reversalTicks + 2) return;
+    if (n < cfg.reversalTicks + 2) return null;
 
     // The spike is between tick[n - reversalTicks - 2] and tick[n - reversalTicks - 1]
     const spikeFrom = ticks[n - cfg.reversalTicks - 2].price;
     const spikeTo   = ticks[n - cfg.reversalTicks - 1].price;
-    if (spikeFrom === 0) return;
+    if (spikeFrom === 0) return null;
     const spikePct  = Math.abs(spikeTo - spikeFrom) / spikeFrom * 100;
     if (spikePct < cfg.spikeThreshold) {
       if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: spike too small ${spikePct.toFixed(4)}% < threshold ${cfg.spikeThreshold}`);
-      return;
+      return { spikePct, candidate: null, rejectReason: 'spike_threshold', fired: false };
     }
 
     const spikeDir  = spikeTo > spikeFrom ? 1 : -1; // +1 = up spike, -1 = down spike
     const spikeAbs  = Math.abs(spikeTo - spikeFrom);
+    const candidate = spikeDir === 1 ? 'SELL' : 'BUY';
 
     // Verify reversal ticks all move opposite to spike
     for (let i = 0; i < cfg.reversalTicks; i++) {
@@ -437,7 +484,7 @@
       const dir = b > a ? 1 : b < a ? -1 : 0;
       if (dir !== -spikeDir) {
         if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: reversal tick wrong direction at i=${i}`);
-        return; // flat or wrong-direction ticks do not confirm reversal
+        return { spikePct, candidate, rejectReason: 'reversal_dir', fired: false };
       }
     }
 
@@ -447,7 +494,7 @@
     const reversalDistance = Math.abs(latestPrice - tipPrice);
     if (spikeAbs > 0 && (reversalDistance / spikeAbs) < cfg.minSnapbackRatio) {
       if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: snapback ${(reversalDistance / spikeAbs).toFixed(3)} < ratio ${cfg.minSnapbackRatio}`);
-      return;
+      return { spikePct, candidate, rejectReason: 'snapback', fired: false };
     }
 
     // ── Gate 2: Local extreme ─────────────────────────────────────────────
@@ -464,14 +511,14 @@
         const localHigh = Math.max.apply(null, lookPrices);
         if (tipPrice < localHigh) {
           if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: local-extreme (up spike tip ${tipPrice} < localHigh ${localHigh})`);
-          return;
+          return { spikePct, candidate, rejectReason: 'extreme', fired: false };
         }
       } else {
         // Down spike → BUY setup: spike tip must be <= local low
         const localLow = Math.min.apply(null, lookPrices);
         if (tipPrice > localLow) {
           if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: local-extreme (down spike tip ${tipPrice} > localLow ${localLow})`);
-          return;
+          return { spikePct, candidate, rejectReason: 'extreme', fired: false };
         }
       }
     }
@@ -487,7 +534,7 @@
       const volRange = (Math.max.apply(null, volPrices) - Math.min.apply(null, volPrices)) / refPrice * 100;
       if (volRange < cfg.minVolatilityPct) {
         if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: volatility ${volRange.toFixed(4)}% < minVolatilityPct ${cfg.minVolatilityPct}`);
-        return;
+        return { spikePct, candidate, rejectReason: 'volatility', fired: false };
       }
     }
 
@@ -495,15 +542,17 @@
     const ticksSinceLast = (n - 1) - lastSignalTickIndex;
     if (ticksSinceLast < cfg.cooldownTicks) {
       if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: cooldown (${ticksSinceLast} ticks since last, need ${cfg.cooldownTicks})`);
-      return;
+      return { spikePct, candidate, rejectReason: 'cooldown', fired: false };
     }
 
-    const sigType  = spikeDir === 1 ? 'SELL' : 'BUY';  // spike up → sell reversal; spike down → buy reversal
+    const sigType  = candidate;
     const sigPrice = ticks[n - 1].price;
     const sigTime  = ticks[n - 1].time;
 
     // Avoid duplicate signal at same timestamp
-    if (signals.length && signals[signals.length - 1].time === sigTime) return;
+    if (signals.length && signals[signals.length - 1].time === sigTime) {
+      return { spikePct, candidate, rejectReason: 'duplicate', fired: false };
+    }
 
     lastSignalTickIndex = n - 1;
 
@@ -514,6 +563,7 @@
     if (cfg.debugSignals) console.log(`[3Tick][signal] ACCEPTED ${sigType} at price ${sigPrice} time ${sigTime}`);
 
     updateSignalsUI();
+    return { spikePct, candidate, rejectReason: null, fired: true };
   }
 
   function scorePendingSignals (currentPrice) {
@@ -673,6 +723,26 @@
     URL.revokeObjectURL(url);
   }
 
+  // ── Tick log CSV export ───────────────────────────────────────────────────
+  function exportTickLog () {
+    if (!tickLog.length) {
+      showAlert('No tick log data to export. Start logging first.');
+      return;
+    }
+    const headers = ['epoch', 'iso_time', 'symbol', 'price', 'spike_pct', 'signal_candidate', 'reject_reason', 'signal_fired'];
+    const rows = [headers].concat(tickLog.map(function (r) {
+      return headers.map(function (h) { return r[h] !== undefined ? r[h] : ''; });
+    }));
+    const csv  = rows.map(function (r) { return r.join(','); }).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = '3tick-log-' + Date.now() + '.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   // ── Local-storage helpers (wrapped to avoid exceptions) ───────────────────
   function safeStorage (op, key, value) {
     try {
@@ -682,9 +752,58 @@
     return null;
   }
 
+  // ── Config persistence ────────────────────────────────────────────────────
+  function getDefaultCfg () {
+    return {
+      spikeThreshold:   0.30,
+      reversalTicks:    1,
+      minSnapbackRatio: 0.5,
+      extremeLookback:  10,
+      cooldownTicks:    2,
+      minVolatilityPct: 0.03,
+      debugSignals:     false,
+    };
+  }
+
+  function loadCfg () {
+    const stored = safeStorage('get', 'tt-cfg');
+    const def    = getDefaultCfg();
+    if (stored && typeof stored === 'object') {
+      Object.keys(def).forEach(function (k) {
+        if (k in stored && stored[k] !== null && stored[k] !== undefined) {
+          def[k] = stored[k];
+        }
+      });
+    }
+    return def;
+  }
+
+  function saveCfg () {
+    safeStorage('set', 'tt-cfg', cfg);
+  }
+
+  // ── Apply loaded config values to UI inputs ───────────────────────────────
+  function applyConfigToUI () {
+    const s   = document.getElementById('tt-cfg-spike');
+    if (s)   s.value     = cfg.spikeThreshold;
+    const r   = document.getElementById('tt-cfg-rev');
+    if (r)   r.value     = cfg.reversalTicks;
+    const sb  = document.getElementById('tt-cfg-snapback');
+    if (sb)  sb.value    = cfg.minSnapbackRatio;
+    const lb  = document.getElementById('tt-cfg-lookback');
+    if (lb)  lb.value    = cfg.extremeLookback;
+    const cd  = document.getElementById('tt-cfg-cooldown');
+    if (cd)  cd.value    = cfg.cooldownTicks;
+    const vp  = document.getElementById('tt-cfg-volpct');
+    if (vp)  vp.value    = cfg.minVolatilityPct;
+    const dbg = document.getElementById('tt-cfg-debug');
+    if (dbg) dbg.checked = cfg.debugSignals;
+  }
+
   // ── Init ──────────────────────────────────────────────────────────────────
   function init () {
     if (document.getElementById('tt-overlay')) return; // already injected
+    cfg = loadCfg();
     buildOverlay();
     connect();
   }
