@@ -41,8 +41,8 @@
     chopHistThreshold: 0.0002,      // MACD histogram magnitude below which market is considered choppy
     nearZeroHistThreshold: 0.01,    // |hist| <= this → near-zero transition zone; requires alignMin+1 before entry
     entryProfile:      'balanced',  // 'early' | 'balanced' | 'strict' – maps to chop/alignment/two-stage thresholds
-    macdTrendEpsilon:  0.00005,     // dead-zone half-width for tick-MACD trend classification
-    macdTrendLookback: 3,           // number of recent ticks used to check histogram direction
+    macdTrendEpsilon:  0.002,       // dead-zone half-width for tick-MACD trend classification (Step Index 100 calibrated)
+    macdTrendLookback: 5,           // number of recent ticks used to check histogram direction
     tickSize:          0.1,         // Step Index 100 minimum price movement (tick size)
     equalCountsAsWin:  true,        // equality at expiry counts as WIN for both BUY and SELL
     // ── Classic spike settings (used when strategyMode === 'classic') ──────
@@ -85,6 +85,9 @@
   let lastWatchdogEvent    = '';   // last watchdog recovery action name; consumed by next tick log entry
 
   let flyoutObserver = null;
+
+  let cachedTickMacdResult = null;
+  let cachedTickMacdSeq    = -1;
 
   let tickLog     = [];    // in-memory tick log rows for diagnostics
   let tickLogging = false; // true when user has started tick logging
@@ -1264,21 +1267,28 @@
     return 'flat';
   }
 
-  // Derive short-term trend from tick-level MACD(12,26,9)
-  // Uses tick prices as the input series (not 1m candles) for finer resolution.
-  // Returns { trend: 'up'|'down'|'flat', macdLine, signalLine, hist }
+  /**
+   * Derive short-term trend from tick-level MACD(12,26,9).
+   * Verified settings: Fast=12, Slow=26, Signal=9 (standard).
+   * Uses live tick prices for high-resolution direction tracking.
+   * Returns { trend: 'up'|'down'|'flat', macdLine, signalLine, hist }
+   */
   function deriveTickMacdTrend () {
+    // Return cached result if already computed for this tick sequence
+    if (tickSeq === cachedTickMacdSeq && cachedTickMacdResult) return cachedTickMacdResult;
+
     const tickPrices = ticks.map(function (t) { return t.price; });
-    const epsilon    = (cfg.macdTrendEpsilon  != null) ? cfg.macdTrendEpsilon  : 0.00005;
-    const lookback   = (cfg.macdTrendLookback != null) ? cfg.macdTrendLookback : 3;
+    const epsilon    = (cfg.macdTrendEpsilon  != null) ? cfg.macdTrendEpsilon  : 0.002;
+    const lookback   = (cfg.macdTrendLookback != null) ? cfg.macdTrendLookback : 5;
 
     // Need at least 26 (slow EMA) + 9 (signal EMA warmup) + lookback ticks
     if (tickPrices.length < 35) {
       return { trend: 'flat', macdLine: NaN, signalLine: NaN, hist: NaN };
     }
 
-    const ema12arr = calcEMA(12, tickPrices);
-    const ema26arr = calcEMA(26, tickPrices);
+    // Standard MACD(12,26,9) calculation
+    const ema12arr = calcEMA(12, tickPrices); // Fast MA Period = 12
+    const ema26arr = calcEMA(26, tickPrices); // Slow MA Period = 26
     const macdArr  = [];
     for (let i = 0; i < tickPrices.length; i++) {
       const v12 = ema12arr[i], v26 = ema26arr[i];
@@ -1308,12 +1318,26 @@
       const sl = sigArr[i];
       if (!isNaN(sl) && isFinite(sl)) recentHist.push(validMacd[i] - sl);
     }
-    const histRising  = recentHist.length >= 2 &&
-                        recentHist[recentHist.length - 1] > recentHist[0];
-    const histFalling = recentHist.length >= 2 &&
-                        recentHist[recentHist.length - 1] < recentHist[0];
 
-    // Classify trend with hysteresis dead-zone around zero.
+    // Robust direction check: require the net move over the window to exceed a noise threshold
+    // Using average-of-halves comparison for better stability (less flicker)
+    let histRising = false, histFalling = false;
+    if (recentHist.length >= 4) {
+      const mid = Math.floor(recentHist.length / 2);
+      const head = recentHist.slice(0, mid);
+      const tail = recentHist.slice(-mid);
+      const headAvg = head.reduce((a, b) => a + b, 0) / head.length;
+      const tailAvg = tail.reduce((a, b) => a + b, 0) / tail.length;
+      const delta   = tailAvg - headAvg;
+      histRising  = delta > (epsilon * 0.1);
+      histFalling = delta < -(epsilon * 0.1);
+    } else if (recentHist.length >= 2) {
+      // Basic fallback if window is too small
+      histRising  = recentHist[recentHist.length - 1] > recentHist[0];
+      histFalling = recentHist[recentHist.length - 1] < recentHist[0];
+    }
+
+    // Classify trend with dead-zone around zero.
     // Two-stage: prefer confirmation from both MACD position AND histogram direction;
     // fall back to MACD position only when histogram direction is ambiguous.
     let trend;
@@ -1324,7 +1348,10 @@
     else if (macdLine < signalLine - epsilon)                { trend = 'down'; } // directional fallback
     else                                                     { trend = 'flat'; }
 
-    return { trend, macdLine, signalLine, hist, histSeries: recentHist };
+    cachedTickMacdResult = { trend, macdLine, signalLine, hist, histSeries: recentHist };
+    cachedTickMacdSeq    = tickSeq;
+
+    return cachedTickMacdResult;
   }
 
   // Update the Trend display using tick-level MACD (called from handleTick)
@@ -1901,8 +1928,8 @@
       sameSideCooldownTicks: 5,
       chopHistThreshold: 0.0002,
       entryProfile:      'balanced',
-      macdTrendEpsilon:  0.00005,
-      macdTrendLookback: 3,
+      macdTrendEpsilon:  0.002,
+      macdTrendLookback: 5,
       spikeMode:        'auto',
       spikeThreshold:   0.001,
       minSpikePoints:   0.1,
