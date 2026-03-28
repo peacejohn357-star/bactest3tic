@@ -52,7 +52,7 @@
     reversalTicks:    1,       // consecutive opposite-direction ticks to confirm reversal
     minSnapbackRatio: 0.2,     // reversal must retrace >= this fraction of spike distance
     extremeLookback:  4,       // spike tip must be local high/low within last N ticks
-    cooldownTicks:    1,       // minimum ticks between new signals
+    cooldownTicks:    5,       // minimum ticks between new signals
     minVolatilityPct: 0.005,   // skip signals when recent range is too flat (%)
     debugSignals:     true,    // log signal accept/reject reasons to console
     // ── Real-trade execution settings ──────────────────────────────────────
@@ -1896,7 +1896,7 @@
       reversalTicks:    1,
       minSnapbackRatio: 0.2,
       extremeLookback:  4,
-      cooldownTicks:    1,
+      cooldownTicks:    5,
       minVolatilityPct: 0.005,
       debugSignals:     true,
     };
