@@ -24,6 +24,14 @@
   const WATCHDOG_RESUB_GRACE    = 3;    // multiplier: resub window = WATCHDOG_TICK_TIMEOUT * this
   const WATCHDOG_RESUB_GRACE_MS = WATCHDOG_TICK_TIMEOUT * WATCHDOG_RESUB_GRACE; // escalation window before reconnect
 
+  // ── DOM Selectors for Real Execution ──────────────────────────────────────
+  const SEL_SIDE_BTNS    = '.trade-params__option > button.item';
+  const SEL_PURCHASE_BTN = 'button.purchase-button.purchase-button--single';
+  const CLASS_RISE_ACTIVE = 'quill__color--primary-purchase';
+  const CLASS_FALL_ACTIVE = 'quill__color--primary-sell';
+  const SEL_FLYOUT       = '.dc-flyout';
+  const SEL_FLYOUT_BODY  = '.dc-flyout__content'; // assumed based on standard dc-flyout structure
+
   let cfg = {
     // ── Strategy mode ──────────────────────────────────────────────────────
     strategyMode:      'indicator', // 'indicator' | 'classic'
@@ -47,6 +55,10 @@
     cooldownTicks:    1,       // minimum ticks between new signals
     minVolatilityPct: 0.005,   // skip signals when recent range is too flat (%)
     debugSignals:     true,    // log signal accept/reject reasons to console
+    // ── Real-trade execution settings ──────────────────────────────────────
+    realTradeEnabled: false,   // master toggle for real trade execution
+    realStake:        0.35,    // stake amount for real trades (default minimum)
+    realTimeoutMs:    40000,   // ms – wait for close confirmation before RECOVERY
   };
 
   // ── State ─────────────────────────────────────────────────────────────────
@@ -70,8 +82,21 @@
   let watchdogLastResubAt  = 0;    // Date.now() of last watchdog resubscribe action (two-stage recovery)
   let lastWatchdogEvent    = '';   // last watchdog recovery action name; consumed by next tick log entry
 
+  let flyoutObserver = null;
+
   let tickLog     = [];    // in-memory tick log rows for diagnostics
   let tickLogging = false; // true when user has started tick logging
+
+  // ── Real-trade state ──────────────────────────────────────────────────────
+  let realExecState   = 'IDLE'; // IDLE | OPEN_PENDING | OPEN | CLOSE_PENDING | RECOVERY
+  let realTrades      = [];     // { time, signal, side, stake, result, pnl, ... }
+  let realOpenCount   = 0;
+  let realWins        = 0;
+  let realLosses      = 0;
+  let realPnl         = 0;
+  let realLockReason  = '';     // reason for blocking trade (e.g. "OPEN_POSITION")
+  let lastRealResult  = null;   // { result, pnl } from last closed real trade
+  let realExecTimer   = null;   // timeout handle for RECOVERY transition
 
   let ws             = null;
   let wsState        = 'disconnected';
@@ -123,6 +148,33 @@
         <div id="tt-sr-list"></div>
         <div class="tt-row"><span class="tt-label">Signals</span></div>
         <div id="tt-signals-list"></div>
+
+        <div class="tt-config-section-label">Real Execution</div>
+        <div id="tt-real-panel">
+          <div class="tt-row">
+            <span class="tt-label">Exec State</span>
+            <span class="tt-val" id="tt-real-state">IDLE</span>
+          </div>
+          <div class="tt-row">
+            <span class="tt-label">Open Count</span>
+            <span class="tt-val" id="tt-real-count">0</span>
+          </div>
+          <div class="tt-row">
+            <span class="tt-label">Real W/L</span>
+            <span class="tt-val">
+              <span class="tt-wins"   id="tt-real-wins">0</span>
+              &nbsp;/&nbsp;
+              <span class="tt-losses" id="tt-real-losses">0</span>
+            </span>
+          </div>
+          <div class="tt-row">
+            <span class="tt-label">Real PnL</span>
+            <span class="tt-val" id="tt-real-pnl">0.00</span>
+          </div>
+          <button id="tt-real-export">⬇ Export Real CSV</button>
+          <button id="tt-real-reset" style="background:#3d1a1a;color:#e04040;margin-top:2px;">Reset Real Engine</button>
+        </div>
+
         <button id="tt-config-toggle">⚙ settings</button>
         <div id="tt-config">
           <div class="tt-config-row">
@@ -208,6 +260,15 @@
           <div class="tt-config-row">
             <label>Debug signals</label>
             <input type="checkbox" id="tt-cfg-debug">
+          </div>
+          <div class="tt-config-section-label">Real Trade Master</div>
+          <div class="tt-config-row">
+            <label style="color:#f0a060;font-weight:700;">Enable Real Execution</label>
+            <input type="checkbox" id="tt-cfg-real-enabled">
+          </div>
+          <div class="tt-config-row">
+            <label>Stake (USD)</label>
+            <input type="number" id="tt-cfg-real-stake" min="0.35" max="5000" step="0.05" value="0.35">
           </div>
         </div>
         <button id="tt-export">⬇ Export CSV</button>
@@ -386,6 +447,31 @@
     document.getElementById('tt-cfg-debug').addEventListener('change', function () {
       cfg.debugSignals = this.checked;
       saveCfg();
+    });
+
+    // ── Real Execution Buttons ──────────────────────────────────────────
+    document.getElementById('tt-cfg-real-enabled').addEventListener('change', function () {
+      cfg.realTradeEnabled = this.checked;
+      saveCfg();
+    });
+
+    document.getElementById('tt-cfg-real-stake').addEventListener('change', function () {
+      const v = parseFloat(this.value);
+      cfg.realStake = (!isNaN(v) && v >= 0.35) ? v : 0.35;
+      saveCfg();
+    });
+
+    document.getElementById('tt-real-export').addEventListener('click', exportRealCSV);
+    document.getElementById('tt-real-reset').addEventListener('click', function () {
+      if (confirm('Reset real-trade engine to IDLE and clear lock?')) {
+        realExecState = 'IDLE';
+        realLockReason = '';
+        realOpenCount = 0;
+        clearTimeout(realExecTimer);
+        realExecTimer = null;
+        updateRealUI();
+        showAlert('Real execution engine reset.');
+      }
     });
 
     document.getElementById('tt-export').addEventListener('click', exportCSV);
@@ -820,6 +906,12 @@
 
     lastSignalFiredAt = Date.now(); // watchdog: track last fired signal
     updateSignalsUI();
+
+    // Trigger real execution if enabled
+    if (cfg.realTradeEnabled) {
+      executeRealTrade(sigType);
+    }
+
     return { spikePct, spikeAbs, spikeMode: mode, candidate, rejectReason: null, fired: true };
   }
 
@@ -1613,6 +1705,12 @@
 
     lastSignalFiredAt = Date.now(); // watchdog: track last fired signal
     updateSignalsUI();
+
+    // Trigger real execution if enabled
+    if (cfg.realTradeEnabled) {
+      executeRealTrade(candidate);
+    }
+
     return Object.assign(baseResult, {
       candidate, rejectReason: null, fired: true,
       chopScore: chopResult.chopScore, alignmentScoreBuy: buyAlignment, alignmentScoreSell: sellAlignment,
@@ -1692,6 +1790,39 @@
     URL.revokeObjectURL(url);
   }
 
+  // ── Real-trade CSV export ─────────────────────────────────────────────────
+  function exportRealCSV () {
+    if (!realTrades.length) {
+      showAlert('No real-trade history to export.');
+      return;
+    }
+    const headers = ['Time', 'Signal', 'Side', 'Stake', 'Result', 'PnL', 'Open Seen At', 'Close Seen At', 'Duration (ms)', 'Source'];
+    const rows = [headers];
+    realTrades.forEach(function (t) {
+      rows.push([
+        new Date(t.time).toISOString(),
+        t.signal,
+        t.side,
+        t.stake,
+        t.result,
+        t.pnl !== undefined ? t.pnl.toFixed(2) : '',
+        t.open_seen_at ? new Date(t.open_seen_at).toISOString() : '',
+        t.close_seen_at ? new Date(t.close_seen_at).toISOString() : '',
+        t.duration_ms || '',
+        t.status_source
+      ]);
+    });
+    console.log('[3Tick][export] realTradeCount=' + (rows.length - 1));
+    const csv  = rows.map(function (r) { return r.join(','); }).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = '3tick-real-trades-' + Date.now() + '.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   // ── Tick log CSV export ───────────────────────────────────────────────────
   function exportTickLog () {
     if (!tickLog.length) {
@@ -1761,6 +1892,33 @@
     safeStorage('set', 'tt-cfg', cfg);
   }
 
+  // ── Real-trade UI helpers ─────────────────────────────────────────────────
+
+  function updateRealUI () {
+    const stEl    = document.getElementById('tt-real-state');
+    const countEl = document.getElementById('tt-real-count');
+    const winsEl  = document.getElementById('tt-real-wins');
+    const lossEl  = document.getElementById('tt-real-losses');
+    const pnlEl   = document.getElementById('tt-real-pnl');
+
+    if (stEl) {
+      stEl.textContent = realExecState;
+      if (realLockReason && realExecState !== 'IDLE') {
+        stEl.textContent += ` (${realLockReason})`;
+      }
+      // Color-coding for states
+      const colors = { IDLE: '#3ecf60', RECOVERY: '#e04040', OPEN: '#f0c040', OPEN_PENDING: '#7ec8e3' };
+      stEl.style.color = colors[realExecState] || '#fff';
+    }
+    if (countEl) countEl.textContent = realOpenCount;
+    if (winsEl)  winsEl.textContent = realWins;
+    if (lossEl)  lossEl.textContent = realLosses;
+    if (pnlEl) {
+      pnlEl.textContent = realPnl.toFixed(2);
+      pnlEl.style.color = realPnl >= 0 ? '#3ecf60' : '#e04040';
+    }
+  }
+
   // ── Apply loaded config values to UI inputs ───────────────────────────────
   function applyConfigToUI () {
     const strat = document.getElementById('tt-cfg-strategy-mode');
@@ -1793,7 +1951,14 @@
     if (macdEpsilonInputEl) macdEpsilonInputEl.value = cfg.macdTrendEpsilon  != null ? cfg.macdTrendEpsilon  : 0.00005;
     const macdLookbackInputEl = document.getElementById('tt-cfg-macd-lookback');
     if (macdLookbackInputEl) macdLookbackInputEl.value = cfg.macdTrendLookback != null ? cfg.macdTrendLookback : 3;
+
+    const realEnabledEl = document.getElementById('tt-cfg-real-enabled');
+    if (realEnabledEl) realEnabledEl.checked = !!cfg.realTradeEnabled;
+    const realStakeEl = document.getElementById('tt-cfg-real-stake');
+    if (realStakeEl)   realStakeEl.value   = cfg.realStake || 0.35;
+
     syncStrategyModeUI(cfg.strategyMode || 'indicator');
+    updateRealUI();
   }
 
   // ── Watchdog (freeze/stall recovery) ─────────────────────────────────────
@@ -1908,6 +2073,196 @@
     }, WATCHDOG_INTERVAL);
   }
 
+  // ── Real-trade DOM Observation ────────────────────────────────────────────
+
+  function parseFlyoutText (text) {
+    if (!text) return { count: 0, closedResult: null };
+
+    // 1. Detect open position count
+    let count = 0;
+    if (text.includes('no open positions')) {
+      count = 0;
+    } else {
+      const match = text.match(/(\d+)\s+open\s+position/i);
+      if (match) count = parseInt(match[1], 10);
+    }
+
+    // 2. Detect close events and PNL
+    // Format: "Closed +0.50 USD" or "Closed -0.35 USD"
+    let closedResult = null;
+    const pnlMatch = text.match(/Closed\s+([+-]?\d+\.?\d*)\s+USD/i);
+    if (pnlMatch) {
+      const pnl = parseFloat(pnlMatch[1]);
+      closedResult = {
+        pnl:    pnl,
+        result: pnl >= 0 ? 'WIN' : 'LOSS'
+      };
+    }
+
+    return { count, closedResult };
+  }
+
+  function setupFlyoutObserver () {
+    if (flyoutObserver) return;
+
+    const target = document.body; // Broad watch to find the flyout when it appears
+    flyoutObserver = new MutationObserver(function (mutations) {
+      const flyout = document.querySelector(SEL_FLYOUT);
+      if (!flyout) {
+        if (realOpenCount !== 0) {
+          realOpenCount = 0;
+          updateRealExecStateFromDOM(0, null);
+        }
+        return;
+      }
+
+      const text = flyout.innerText;
+      const { count, closedResult } = parseFlyoutText(text);
+
+      if (count !== realOpenCount || closedResult) {
+        realOpenCount = count;
+        updateRealExecStateFromDOM(count, closedResult);
+      }
+    });
+
+    flyoutObserver.observe(target, { childList: true, subtree: true, characterData: true });
+    console.log('[3Tick][real] Flyout observer active');
+  }
+
+  function updateRealExecStateFromDOM (count, closedResult) {
+    const prevState = realExecState;
+
+    // Logic to transition state based on DOM observations
+    if (count > 0 && (realExecState === 'IDLE' || realExecState === 'OPEN_PENDING')) {
+      realExecState = 'OPEN';
+      clearTimeout(realExecTimer);
+      realExecTimer = null;
+    }
+
+    if (count === 0 && (realExecState === 'OPEN' || realExecState === 'CLOSE_PENDING')) {
+      realExecState = 'IDLE';
+    }
+
+    if (closedResult && realExecState !== 'IDLE') {
+      finalizeRealTrade(closedResult);
+      realExecState = 'IDLE'; // Force idle after result seen
+    }
+
+    if (prevState !== realExecState) {
+      console.log(`[3Tick][real] State change: ${prevState} -> ${realExecState} (count=${count})`);
+      updateRealUI();
+    }
+  }
+
+  function finalizeRealTrade (res) {
+    if (!realTrades.length) return;
+    const last = realTrades[realTrades.length - 1];
+    if (last.result !== 'PENDING') return;
+
+    last.result = res.result;
+    last.pnl    = res.pnl;
+    last.close_seen_at = Date.now();
+    last.duration_ms   = last.close_seen_at - last.open_seen_at;
+
+    if (res.result === 'WIN') realWins++;
+    else                      realLosses++;
+    realPnl += res.pnl;
+    lastRealResult = res;
+
+    updateRealUI();
+    console.log(`[3Tick][real] Trade finalized: ${res.result} (${res.pnl})`);
+  }
+
+  // ── Real Execution Core ───────────────────────────────────────────────────
+
+  async function executeRealTrade (side) {
+    if (realExecState !== 'IDLE') {
+      console.warn(`[3Tick][real] Execution blocked: state=${realExecState}`);
+      return;
+    }
+
+    const buyLabel = side === 'BUY' ? 'Rise' : 'Fall';
+    const activeClass = side === 'BUY' ? CLASS_RISE_ACTIVE : CLASS_FALL_ACTIVE;
+
+    realExecState = 'OPEN_PENDING';
+    realLockReason = 'EXECUTING';
+    updateRealUI();
+
+    try {
+      // 1. Verify side and set if necessary
+      const sideSet = await setRealTradeSide(buyLabel, activeClass);
+      if (!sideSet) throw new Error('side_verification_failed');
+
+      // 2. Verify buy readiness
+      const ready = await waitRealBuyReady();
+      if (!ready) throw new Error('buy_not_ready');
+
+      // 3. Perform Purchase
+      const btn = document.querySelector(SEL_PURCHASE_BTN);
+      if (!btn) throw new Error('purchase_btn_missing');
+
+      btn.click();
+      console.log(`[3Tick][real] CLICKED ${side} (${buyLabel})`);
+
+      // 4. Record pending real trade
+      const trade = {
+        time:         Date.now(),
+        signal:       side,
+        side:         buyLabel,
+        stake:        cfg.realStake,
+        result:       'PENDING',
+        open_seen_at: Date.now(),
+        status_source: 'automation'
+      };
+      realTrades.push(trade);
+
+      // 5. Start timeout for recovery
+      realExecTimer = setTimeout(() => {
+        if (realExecState === 'OPEN_PENDING' || realExecState === 'OPEN') {
+          console.error('[3Tick][real] RECOVERY triggered – trade timeout');
+          realExecState = 'RECOVERY';
+          realLockReason = 'TIMEOUT';
+          updateRealUI();
+        }
+      }, cfg.realTimeoutMs);
+
+    } catch (e) {
+      console.error(`[3Tick][real] Execution failed: ${e.message}`);
+      realExecState = 'IDLE';
+      realLockReason = e.message;
+      updateRealUI();
+    }
+  }
+
+  async function setRealTradeSide (label, activeClass) {
+    // Retries for side verification
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const btn = document.querySelector(SEL_PURCHASE_BTN);
+      if (btn && btn.classList.contains(activeClass)) return true;
+
+      const sideBtns = Array.from(document.querySelectorAll(SEL_SIDE_BTNS));
+      const target = sideBtns.find(b => b.innerText.includes(label));
+      if (target) {
+        target.click();
+        await new Promise(r => setTimeout(r, 200)); // wait for DOM update
+      }
+    }
+    return false;
+  }
+
+  async function waitRealBuyReady () {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const btn = document.querySelector(SEL_PURCHASE_BTN);
+      if (btn) {
+        const isLoading = btn.getAttribute('data-loading') === 'true';
+        const isDisabled = btn.disabled || btn.getAttribute('aria-disabled') === 'true';
+        if (!isLoading && !isDisabled) return true;
+      }
+      await new Promise(r => setTimeout(r, 300));
+    }
+    return false;
+  }
+
   // ── Init ──────────────────────────────────────────────────────────────────
   function init () {
     if (document.getElementById('tt-overlay')) return; // already injected
@@ -1915,6 +2270,7 @@
     buildOverlay();
     connect();
     startWatchdog(); // idempotent – safe to call on every init
+    setupFlyoutObserver();
   }
 
   // Wait until the page body is available, then inject
