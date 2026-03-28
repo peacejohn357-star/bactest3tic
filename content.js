@@ -59,6 +59,8 @@
     realTradeEnabled: false,   // master toggle for real trade execution
     realTimeoutMs:    40000,   // ms – wait for close confirmation before RECOVERY
     realCooldownMs:   5000,    // ms – minimum time between real trade executions
+    postTradeCooldownTicks: 5, // ticks to wait after a trade closes before new entry
+    postTradeCooldownMs:    5000, // ms to wait after a trade closes before new entry
   };
 
   // ── State ─────────────────────────────────────────────────────────────────
@@ -98,6 +100,8 @@
   let lastRealResult  = null;   // { result, pnl } from last closed real trade
   let realExecTimer   = null;   // timeout handle for RECOVERY transition
   let lastRealTradeAt = 0;      // Date.now() of last execution click
+  let lastTradeClosedAt = 0;    // Date.now() when last trade (real or sim) finished
+  let lastTradeClosedTick = -999; // tickSeq when last trade finished
 
   let ws             = null;
   let wsState        = 'disconnected';
@@ -872,12 +876,28 @@
       }
     }
 
-    // ── Gate 4: Cooldown ──────────────────────────────────────────────────
+    // ── Gate 4: Cooldown & Global Lock ────────────────────────────────────
     const currentTickIndex = tickSeq;
+
+    // A. Strategy Cooldown (Ticks since signal)
     const ticksSinceLast = currentTickIndex - lastSignalTickIndex;
     if (ticksSinceLast < cfg.cooldownTicks) {
       if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: cooldown (${ticksSinceLast} ticks since last, need ${cfg.cooldownTicks})`);
       return { spikePct, candidate, rejectReason: 'cooldown', fired: false };
+    }
+
+    // B. Post-Trade Cooldown (Ticks & Time since close)
+    const ticksSinceClose = currentTickIndex - lastTradeClosedTick;
+    const msSinceClose    = Date.now() - lastTradeClosedAt;
+    if (ticksSinceClose < cfg.postTradeCooldownTicks || msSinceClose < cfg.postTradeCooldownMs) {
+      if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: post_trade_cooldown (ticks=${ticksSinceClose} ms=${msSinceClose})`);
+      return { spikePct, candidate, rejectReason: 'post_trade_lock', fired: false };
+    }
+
+    // C. Real Trade Parity Lock (Simulator only trades when Real engine is IDLE)
+    if (cfg.realTradeEnabled && realExecState !== 'IDLE') {
+      if (cfg.debugSignals) console.log(`[3Tick][signal] rejected: real_engine_busy (state=${realExecState})`);
+      return { spikePct, candidate, rejectReason: 'real_engine_busy', fired: false };
     }
 
     const sigType  = candidate;
@@ -957,6 +977,13 @@
     signals.forEach(function (sig) {
       if (sig.result !== 'PENDING') return;
 
+      // If real trading is active, we let the DOM finalize the trade result to ensure sync.
+      // We still collect ticks for duration tracking if needed, but results are synced in finalizeRealTrade.
+      if (cfg.realTradeEnabled) {
+         sig.ticksAfter.push(currentPrice);
+         return;
+      }
+
       sig.ticksAfter.push(currentPrice);
 
       // ── Real-world timing alignment ──
@@ -978,6 +1005,11 @@
         sig.priceAfter = exit;
         if (isWin) { wins++;   updateWinsLossesUI(); }
         else       { losses++; updateWinsLossesUI(); }
+
+        // Update global cooldown markers
+        lastTradeClosedAt   = Date.now();
+        lastTradeClosedTick = tickSeq;
+
         changed = true;
       }
     });
@@ -1592,12 +1624,28 @@
       }
     }
 
-    // 7. Global cooldown guard
+    // 7. Global Cooldown & Parity Guard
     const currentTickIndex = tickSeq;
+
+    // A. Strategy Cooldown
     const ticksSinceLast = currentTickIndex - lastSignalTickIndex;
     if (ticksSinceLast < cfg.cooldownTicks) {
       if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: cooldown (' + ticksSinceLast + ' ticks since last, need ' + cfg.cooldownTicks + ')');
       return Object.assign(baseResult, { candidate, rejectReason: 'cooldown', fired: false });
+    }
+
+    // B. Post-Trade Cooldown
+    const ticksSinceClose = currentTickIndex - lastTradeClosedTick;
+    const msSinceClose    = Date.now() - lastTradeClosedAt;
+    if (ticksSinceClose < cfg.postTradeCooldownTicks || msSinceClose < cfg.postTradeCooldownMs) {
+      if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: post_trade_cooldown');
+      return Object.assign(baseResult, { candidate, rejectReason: 'post_trade_lock', fired: false });
+    }
+
+    // C. Real Trade Parity Lock
+    if (cfg.realTradeEnabled && realExecState !== 'IDLE') {
+      if (cfg.debugSignals) console.log('[3Tick][indicator] rejected: real_engine_busy');
+      return Object.assign(baseResult, { candidate, rejectReason: 'real_engine_busy', fired: false });
     }
 
     // 8. Same-side cooldown guard
@@ -2094,6 +2142,7 @@
 
     // 2. Detect close events and PNL
     // Format: "Closed +0.50 USD" or "Closed -0.35 USD"
+    // Also support "You have no open positions" as a signal to close if OPEN
     let closedResult = null;
     const pnlMatch = text.match(/Closed\s+([+-]?\d+\.?\d*)\s+USD/i);
     if (pnlMatch) {
@@ -2102,6 +2151,9 @@
         pnl:    pnl,
         result: pnl >= 0 ? 'WIN' : 'LOSS'
       };
+    } else if (text.includes('no open positions') && realExecState === 'OPEN') {
+      // Emergency close: if count is 0 and we were open but missed the PNL text
+      closedResult = { pnl: 0, result: 'UNKNOWN' };
     }
 
     return { count, closedResult };
@@ -2140,6 +2192,8 @@
     // Logic to transition state based on DOM observations
     if (count > 0 && (realExecState === 'IDLE' || realExecState === 'OPEN_PENDING')) {
       realExecState = 'OPEN';
+      // Sync pending simulation signal with actual market fill price
+      syncSimulatorEntryToMarket();
     }
 
     if (count === 0 && (realExecState === 'OPEN' || realExecState === 'CLOSE_PENDING' || realExecState === 'RECOVERY')) {
@@ -2158,6 +2212,19 @@
     }
   }
 
+  function syncSimulatorEntryToMarket () {
+    // Look for a pending simulated signal that doesn't have a Fill Price yet
+    const pending = signals.find(s => s.result === 'PENDING' && !s.entryPriceReal);
+    if (pending) {
+      const currentPrice = ticks.length ? ticks[ticks.length - 1].price : 0;
+      if (currentPrice > 0) {
+        pending.entryPriceReal = currentPrice;
+        console.log(`[3Tick][sync] Synced simulator entry to market fill price: ${currentPrice}`);
+        updateSignalsUI();
+      }
+    }
+  }
+
   function finalizeRealTrade (res) {
     if (!realTrades.length) return;
     const last = realTrades[realTrades.length - 1];
@@ -2172,6 +2239,23 @@
     else                      realLosses++;
     realPnl += res.pnl;
     lastRealResult = res;
+
+    // ── Sync Simulator Result ──
+    // When real execution is enabled, the simulated trade should match the market reality
+    const simTrade = signals.find(s => s.result === 'PENDING');
+    if (simTrade && cfg.realTradeEnabled) {
+       simTrade.result = res.result;
+       simTrade.priceAfter = ticks.length ? ticks[ticks.length - 1].price : simTrade.price;
+       console.log(`[3Tick][sync] Overrode simulator result with market result: ${res.result}`);
+       // Update original simulation stats to keep parity
+       if (res.result === 'WIN') wins++;
+       else                      losses++;
+       updateWinsLossesUI();
+    }
+
+    // Update global cooldown markers (parity with sim)
+    lastTradeClosedAt   = Date.now();
+    lastTradeClosedTick = tickSeq;
 
     // Trade closed successfully, clear the safety timer
     clearTimeout(realExecTimer);
