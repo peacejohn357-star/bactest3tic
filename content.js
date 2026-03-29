@@ -274,14 +274,18 @@
       // SETUP (T-1): Normal Speed + Digit 2, 5, or 9
       // TRIGGER (T0): Direction Flip (DOWN->UP) + Accel 2.0
       if (t0.direction === 1 && tMinus1.direction === -1 && Math.abs(t0.deltaChange - 2.0) < 0.01) {
-        if ([2, 5, 9].includes(tMinus1.lastDigit)) return { type: 'BUY', conf: 90 };
+        if ([2, 5, 9].includes(tMinus1.lastDigit)) {
+          return { type: 'BUY', conf: 90, triggerDigit: tMinus1.lastDigit, triggerDesc: 'Flip+Accel(2.0)' };
+        }
       }
 
       // SELL DNA (Catching 5+ DOWN Streaks)
       // SETUP (T-1): Normal Speed + Digit 9 or 6
       // TRIGGER (T0): Direction Flip (UP->DOWN) + Accel -2.0
       if (t0.direction === -1 && tMinus1.direction === 1 && Math.abs(t0.deltaChange + 2.0) < 0.01) {
-        if ([9, 6].includes(tMinus1.lastDigit)) return { type: 'SELL', conf: 90 };
+        if ([9, 6].includes(tMinus1.lastDigit)) {
+          return { type: 'SELL', conf: 90, triggerDigit: tMinus1.lastDigit, triggerDesc: 'Flip+Accel(-2.0)' };
+        }
       }
       return null;
     };
@@ -302,7 +306,18 @@
         if (currentTickIndex - lastSignalTickIndex < cfg.postTradeCooldownTicks || Date.now() - lastTradeClosedAt < cfg.postTradeCooldownMs || realExecState !== 'IDLE') return null;
         lastSignalTickIndex = currentTickIndex;
         let conf = res.conf; if ((res.type === 'BUY' && !buyDigitBias) || (res.type === 'SELL' && !sellDigitBias)) conf -= 10;
-        const sig = { type: res.type, price: t0.price, time: t0.epoch, result: 'PENDING', ticksAfter: [], confidence: Math.min(100, conf), strategy: mode, isReal: cfg.realTradeEnabled };
+        const sig = {
+          type: res.type,
+          price: t0.price,
+          time: t0.epoch,
+          result: 'PENDING',
+          ticksAfter: [],
+          confidence: Math.min(100, conf),
+          strategy: mode,
+          isReal: cfg.realTradeEnabled,
+          triggerDigit: res.triggerDigit,
+          triggerDesc: res.triggerDesc
+        };
         signals.push(sig); if (signals.length > 50) signals.shift(); recordSessionTrade(sig); updateSignalsUI();
         if (cfg.realTradeEnabled) { realExecState = 'OPEN_PENDING'; realLockReason = 'EXECUTING'; updateRealUI(); executeRealTrade(res.type); }
       }
@@ -353,13 +368,16 @@
   function recordSessionTrade(sig) { sessionTradesAll.push(sig); if (sessionTradesAll.length > SESSION_HISTORY_CAP) sessionTradesAll.shift(); }
   function exportCSV() {
     if (!sessionTradesAll.length) return;
-    const rows = [['Type', 'Strategy', 'Confidence', 'Price', 'Time', 'Result']].concat(sessionTradesAll.map(s => [s.type, s.strategy, s.confidence, s.price.toFixed(2), s.time, s.result]));
+    const rows = [['Type', 'Strategy', 'Confidence', 'Price', 'Time', 'Result', 'Trigger Digit', 'Trigger Desc']].concat(sessionTradesAll.map(s => [s.type, s.strategy, s.confidence, s.price.toFixed(2), s.time, s.result, s.triggerDigit ?? '', s.triggerDesc ?? '']));
     const csv = rows.map(r => r.join(',')).join('\n'); const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = '3tick-signals.csv'; a.click();
   }
   function exportRealCSV() {
     if (!realTrades.length) return;
-    const rows = [['Time', 'Signal', 'Side', 'Result', 'PnL']].concat(realTrades.map(t => [new Date(t.time).toISOString(), t.signal, t.side, t.result, t.pnl || '']));
+    const rows = [['Time', 'Signal', 'Side', 'Result', 'PnL', 'Trigger Digit', 'Trigger Desc']].concat(realTrades.map(t => {
+      const s = t.signalRef || {};
+      return [new Date(t.time).toISOString(), t.signal, t.side, t.result, t.pnl || '', s.triggerDigit ?? '', s.triggerDesc ?? ''];
+    }));
     const csv = rows.map(r => r.join(',')).join('\n'); const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = '3tick-real.csv'; a.click();
   }
