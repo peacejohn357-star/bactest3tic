@@ -46,6 +46,9 @@
   let realExecState = 'IDLE', realTrades = [], realOpenCount = 0, realWins = 0, realLosses = 0, realPnl = 0, realLockReason = '', lastRealTradeAt = 0, lastTradeClosedAt = 0, lastTradeClosedTick = -999, realExecTimer = null;
   let flyoutObserver = null, ws = null, wsState = 'disconnected', reconnectTimer = null, resolvedSymbol = null, manualClose = false, reconnectDelay = RECONNECT_BASE, failCount = 0, usingFallback = false;
 
+  // UI Cache to prevent redundant DOM updates
+  let lastUI = { state: '', pnl: null, wins: -1, losses: -1, price: '', stats: '', dist: '' };
+
   // ── Overlay Build ─────────────────────────────────────────────────────────
   function buildOverlay() {
     if (document.getElementById('tt-overlay')) return;
@@ -168,9 +171,22 @@
     const sum = speedHistory.reduce((a, b) => a + b, 0); speedMean = sum / speedHistory.length;
     const sqDiff = speedHistory.map(v => Math.pow(v - speedMean, 2)); speedStd = Math.sqrt(sqDiff.reduce((a, b) => a + b, 0) / speedHistory.length);
     sHigh = Math.max(p70, speedMean + speedStd); sLow = Math.min(p30, Math.max(0, speedMean - speedStd));
-    const statsEl = document.getElementById('tt-speed-stats'), distEl = document.getElementById('tt-speed-dist');
-    if (statsEl) statsEl.textContent = `${sLow.toFixed(4)} / ${sHigh.toFixed(4)}`;
-    if (distEl) distEl.textContent = `${speedMean.toFixed(4)} / ${speedStd.toFixed(4)}`;
+
+    // Throttle UI updates for stats
+    if (tickSeq % 5 === 0) {
+      const statsVal = `${sLow.toFixed(4)} / ${sHigh.toFixed(4)}`;
+      const distVal = `${speedMean.toFixed(4)} / ${speedStd.toFixed(4)}`;
+      if (lastUI.stats !== statsVal) {
+        const el = document.getElementById('tt-speed-stats');
+        if (el) el.textContent = statsVal;
+        lastUI.stats = statsVal;
+      }
+      if (lastUI.dist !== distVal) {
+        const el = document.getElementById('tt-speed-dist');
+        if (el) el.textContent = distVal;
+        lastUI.dist = distVal;
+      }
+    }
   }
 
   function handleTick(tick) {
@@ -187,7 +203,14 @@
     ticks.push(state); if (ticks.length > TICK_BUF) ticks.shift();
     speedHistory.push(absSpeed); if (speedHistory.length > SPEED_BUF) speedHistory.shift();
     calculatePercentiles(); lastTickProcessedAt = Date.now();
-    const priceEl = document.getElementById('tt-price'); if (priceEl) priceEl.textContent = price.toFixed(2);
+
+    const priceStr = price.toFixed(2);
+    if (lastUI.price !== priceStr) {
+      const el = document.getElementById('tt-price');
+      if (el) el.textContent = priceStr;
+      lastUI.price = priceStr;
+    }
+
     try { detectSignal(); lastSignalEvalAt = Date.now(); } catch (e) { evalErrorCount++; }
     signals.forEach(sig => { if (sig.result === 'PENDING') sig.ticksAfter.push(price); });
   }
@@ -245,8 +268,16 @@
 
   // ── Infrastructure ────────────────────────────────────────────────────────
   function updateWinsLossesUI() {
-    const we = document.getElementById('tt-wins'), le = document.getElementById('tt-losses');
-    if (we) we.textContent = realWins; if (le) le.textContent = realLosses;
+    if (lastUI.wins !== realWins) {
+      const we = document.getElementById('tt-wins');
+      if (we) we.textContent = realWins;
+      lastUI.wins = realWins;
+    }
+    if (lastUI.losses !== realLosses) {
+      const le = document.getElementById('tt-losses');
+      if (le) le.textContent = realLosses;
+      lastUI.losses = realLosses;
+    }
   }
   function updateSignalsUI() {
     const el = document.getElementById('tt-signals-list'); if (!el) return;
@@ -258,9 +289,23 @@
     });
   }
   function updateRealUI() {
-    const stEl = document.getElementById('tt-real-state'), pnlEl = document.getElementById('tt-real-pnl');
-    if (stEl) { stEl.textContent = realExecState + (realLockReason ? ` (${realLockReason})` : ''); stEl.style.color = { IDLE: '#3ecf60', RECOVERY: '#e04040', OPEN: '#f0c040', OPEN_PENDING: '#7ec8e3' }[realExecState] || '#fff'; }
-    if (pnlEl) { pnlEl.textContent = realPnl.toFixed(2); pnlEl.style.color = realPnl >= 0 ? '#3ecf60' : '#e04040'; }
+    const stateStr = realExecState + (realLockReason ? ` (${realLockReason})` : '');
+    if (lastUI.state !== stateStr) {
+      const stEl = document.getElementById('tt-real-state');
+      if (stEl) {
+        stEl.textContent = stateStr;
+        stEl.style.color = { IDLE: '#3ecf60', RECOVERY: '#e04040', OPEN: '#f0c040', OPEN_PENDING: '#7ec8e3' }[realExecState] || '#fff';
+      }
+      lastUI.state = stateStr;
+    }
+    if (lastUI.pnl !== realPnl) {
+      const pnlEl = document.getElementById('tt-real-pnl');
+      if (pnlEl) {
+        pnlEl.textContent = realPnl.toFixed(2);
+        pnlEl.style.color = realPnl >= 0 ? '#3ecf60' : '#e04040';
+      }
+      lastUI.pnl = realPnl;
+    }
     updateWinsLossesUI();
   }
   function showAlert(msg) { const el = document.getElementById('tt-alert'); if (el) { el.textContent = msg; el.classList.add('tt-visible'); setTimeout(() => el.classList.remove('tt-visible'), 5000); } }
@@ -284,13 +329,41 @@
   function startWatchdog() { if (watchdogInterval) clearInterval(watchdogInterval); watchdogInterval = setInterval(() => { const now = Date.now(); if (wsState !== 'connected') return; if (lastTickProcessedAt > 0 && now - lastTickProcessedAt > WATCHDOG_TICK_TIMEOUT) { if (ws) ws.close(); scheduleReconnect(); } }, WATCHDOG_INTERVAL); }
   function setupFlyoutObserver() {
     if (flyoutObserver) return;
-    flyoutObserver = new MutationObserver(() => {
-      const flyout = document.querySelector(SEL_FLYOUT); if (!flyout) { if (realOpenCount !== 0) { realOpenCount = 0; updateRealExecStateFromDOM(0, null); } return; }
-      const text = flyout.innerText; let count = text.includes('no open positions') ? 0 : (text.match(/(\d+)\s+open\s+position/i) ? parseInt(text.match(/(\d+)\s+open\s+position/i)[1], 10) : realOpenCount);
-      let closedResult = null; const pnlMatch = text.match(/Closed\s+([+-]?\d+\.?\d*)\s+USD/i); if (pnlMatch) closedResult = { pnl: parseFloat(pnlMatch[1]), result: parseFloat(pnlMatch[1]) >= 0 ? 'WIN' : 'LOSS' };
-      else if (text.includes('no open positions') && realExecState === 'OPEN') closedResult = { pnl: 0, result: 'UNKNOWN' };
-      if (count !== realOpenCount || closedResult) { realOpenCount = count; updateRealExecStateFromDOM(count, closedResult); }
-    }); flyoutObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+    flyoutObserver = new MutationObserver((mutations) => {
+      // Filter out mutations that happen inside our own overlay to prevent infinite loops
+      const hasPlatformMutation = mutations.some(m => {
+        let node = m.target;
+        if (node.nodeType === 3) node = node.parentElement; // Text node -> Element
+        if (!node || node.id === 'tt-overlay' || node.closest?.('#tt-overlay')) return false;
+        return true;
+      });
+      if (!hasPlatformMutation) return;
+
+      const flyout = document.querySelector(SEL_FLYOUT);
+      if (!flyout) {
+        if (realOpenCount !== 0) {
+          realOpenCount = 0;
+          updateRealExecStateFromDOM(0, null);
+        }
+        return;
+      }
+
+      const text = flyout.textContent;
+      let count = text.includes('no open positions') ? 0 : (text.match(/(\d+)\s+open\s+position/i) ? parseInt(text.match(/(\d+)\s+open\s+position/i)[1], 10) : realOpenCount);
+      let closedResult = null;
+      const pnlMatch = text.match(/Closed\s+([+-]?\d+\.?\d*)\s+USD/i);
+      if (pnlMatch) {
+        closedResult = { pnl: parseFloat(pnlMatch[1]), result: parseFloat(pnlMatch[1]) >= 0 ? 'WIN' : 'LOSS' };
+      } else if (text.includes('no open positions') && realExecState === 'OPEN') {
+        closedResult = { pnl: 0, result: 'UNKNOWN' };
+      }
+
+      if (count !== realOpenCount || closedResult) {
+        realOpenCount = count;
+        updateRealExecStateFromDOM(count, closedResult);
+      }
+    });
+    flyoutObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
   }
   function updateRealExecStateFromDOM(count, closedResult) {
     if (closedResult && ['OPEN', 'OPEN_PENDING', 'RECOVERY'].includes(realExecState)) { finalizeRealTrade(closedResult); realExecState = 'IDLE'; realLockReason = ''; }
