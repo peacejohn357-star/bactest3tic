@@ -271,10 +271,10 @@
       if (!isCalm) return null;
 
       // BUY DNA (Catching 5+ UP Streaks)
-      // SETUP (T-1): Normal Speed + Digit 2, 5, or 9
+      // SETUP (T-1): Normal Speed + Digit 2
       // TRIGGER (T0): Direction Flip (DOWN->UP) + Accel 2.0
       if (t0.direction === 1 && tMinus1.direction === -1 && t0.deltaChange === 2) {
-        if ([2, 5, 9].includes(tMinus1.lastDigit)) {
+        if (tMinus1.lastDigit === 2) {
           return { type: 'BUY', conf: 90, triggerDigit: tMinus1.lastDigit, triggerDesc: 'Flip+Accel(2.0)' };
         }
       }
