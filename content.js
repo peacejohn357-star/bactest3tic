@@ -280,10 +280,10 @@
       }
 
       // SELL DNA (Catching 5+ DOWN Streaks)
-      // SETUP (T-1): Normal Speed + Digit 6
+      // SETUP (T-1): Normal Speed + Digit 2
       // TRIGGER (T0): Direction Flip (UP->DOWN) + Accel -2.0
       if (t0.direction === -1 && tMinus1.direction === 1 && t0.deltaChange === -2) {
-        if (tMinus1.lastDigit === 6) {
+        if (tMinus1.lastDigit === 2) {
           return { type: 'SELL', conf: 90, triggerDigit: tMinus1.lastDigit, triggerDesc: 'Flip+Accel(-2.0)' };
         }
       }
@@ -407,13 +407,13 @@
         }
       }
     });
-    flyoutObserver.observe(document.body, { childList: true });
+    flyoutObserver.observe(document.body, { childList: true, subtree: true });
   }
 
   function processFlyout(flyout) {
       const text = flyout.innerText;
-      const hasProfitClass = !!flyout.querySelector('.dc-contract-card--profit, .dc-contract-card__profit-loss--is-profit');
-      const hasLossClass = !!flyout.querySelector('.dc-contract-card--loss, .dc-contract-card__profit-loss--is-loss');
+      const hasProfitClass = !!flyout.querySelector('.dc-contract-card--profit, .dc-contract-card__profit-loss--is-profit, .dc-contract-card-item__body--profit');
+      const hasLossClass = !!flyout.querySelector('.dc-contract-card--loss, .dc-contract-card__profit-loss--is-loss, .dc-contract-card-item__body--loss');
 
       // Track real-time PnL from the flyout while trade is open
       // Use specific selectors if possible, otherwise regex on innerText
@@ -434,8 +434,8 @@
 
       // EXPLICIT WIN/LOSS DETECTION
       // Definite Win: Profit class or positive lastSeenPnL
-      const isDefiniteWin = (hasProfitClass && lastSeenPnL > 0) || lastSeenPnL > 0;
-      // Definite Loss: Contract value 0.00, Loss class, "Loss" text, or NEGATIVE lastSeenPnL
+      const isDefiniteWin = hasProfitClass || lastSeenPnL > 0;
+      // Definite Loss: Contract value 0.00, Loss class, "Loss" text, or non-positive lastSeenPnL
       const isDefiniteLoss = hasLossClass || /Contract\s+value:\s*0\.00/i.test(text) || /Loss/i.test(text) || lastSeenPnL < 0 || (lastSeenPnL === 0 && !isDefiniteWin);
 
       // Detection of terminal state
