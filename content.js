@@ -75,7 +75,7 @@
         </div>
         <button id="tt-config-toggle">Settings</button>
         <div id="tt-config">
-          <div class="tt-config-row"><label>Mode</label><select id="tt-cfg-strategy-mode"><option value="structural">Structural</option><option value="hybrid">Hybrid</option><option value="momentum">Momentum</option><option value="reversal">Reversal</option></select></div>
+          <div class="tt-config-row"><label>Mode</label><select id="tt-cfg-strategy-mode"><option value="structural">Structural</option><option value="structural2">Structural 2</option><option value="hybrid">Hybrid</option><option value="momentum">Momentum</option><option value="reversal">Reversal</option></select></div>
           <div class="tt-config-row"><label>Epsilon</label><input type="number" id="tt-cfg-epsilon" min="0" max="1" step="0.01" value="0.2"></div>
           <div class="tt-config-row"><label>Debug Signals</label><input type="checkbox" id="tt-cfg-debug"></div>
           <div class="tt-config-section-label">Real Trade Master</div>
@@ -248,12 +248,18 @@
       if (t0.direction === 1 && isLate && t0.absSpeed <= sLow && t0.deltaChange < eps && t0.speedTrend < 0) return { type: 'SELL', conf: 75 };
       return null;
     };
+    const checkStructural2 = () => {
+      if (t0.direction === 1 && t0.deltaChange > 0 && [6, 7].includes(t0.lastDigit)) return { type: 'BUY', conf: 80 };
+      if (t0.direction === -1 && t0.deltaChange < 0 && [3, 4].includes(t0.lastDigit)) return { type: 'SELL', conf: 75 };
+      return null;
+    };
 
     let res = null;
-    // Evaluation Priority: Structural → Hybrid → Momentum → Reversal
-    if (mode === 'structural') res = checkStructural();
-    else if (mode === 'hybrid') res = checkHybrid() || checkStructural();
-    else if (mode === 'momentum') res = checkMomentum() || checkHybrid() || checkStructural();
+    // Evaluation Priority: Structural 2 → Structural → Hybrid → Momentum → Reversal
+    if (mode === 'structural2') res = checkStructural2();
+    else if (mode === 'structural') res = checkStructural();
+    else if (mode === 'hybrid') res = checkHybrid() || checkStructural2() || checkStructural();
+    else if (mode === 'momentum') res = checkMomentum() || checkHybrid() || checkStructural2() || checkStructural();
     else if (mode === 'reversal') res = checkReversal();
 
     if (res) {
@@ -420,25 +426,14 @@
     if (Date.now() - lastRealTradeAt < cfg.realCooldownMs) return;
     const buyLabel = side === 'BUY' ? 'Rise' : 'Fall', activeClass = side === 'BUY' ? CLASS_RISE_ACTIVE : CLASS_FALL_ACTIVE;
     try {
-      // Find signal first
-      const signalToMark = signals.find(s => s.result === 'PENDING' && s.isReal);
-
-      // Only proceed if we aren't already simulating a click (redundancy check)
       if (!await setRealTradeSide(buyLabel, activeClass)) throw new Error('side_failed');
       if (!await waitRealBuyReady()) throw new Error('not_ready');
-      const btn = document.querySelector(SEL_PURCHASE_BTN);
-      if (!btn || !btn.classList.contains(activeClass)) throw new Error('btn_mismatch');
-
-      simulateExternalClick(btn);
-      lastRealTradeAt = Date.now();
-
+      const btn = document.querySelector(SEL_PURCHASE_BTN); if (!btn || !btn.classList.contains(activeClass)) throw new Error('btn_mismatch');
+      simulateExternalClick(btn); lastRealTradeAt = Date.now();
+      const signalToMark = signals.find(s => s.result === 'PENDING' && s.isReal);
       realTrades.push({ time: Date.now(), signal: side, side: buyLabel, result: 'PENDING', signalRef: signalToMark });
       realExecTimer = setTimeout(() => { if (['OPEN_PENDING', 'OPEN'].includes(realExecState)) { realExecState = 'RECOVERY'; realLockReason = 'TIMEOUT'; updateRealUI(); } }, cfg.realTimeoutMs);
-    } catch (e) {
-      realLockReason = 'ERR:' + e.message;
-      updateRealUI();
-      setTimeout(() => { if (realExecState === 'OPEN_PENDING') { realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); } }, 3000);
-    }
+    } catch (e) { realLockReason = 'ERR:' + e.message; updateRealUI(); setTimeout(() => { if (realExecState === 'OPEN_PENDING') { realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); } }, 3000); }
   }
   async function setRealTradeSide(label, activeClass) { for (let i = 0; i < 3; i++) { await new Promise(r => setTimeout(r, 150)); const btn = document.querySelector(SEL_PURCHASE_BTN); if (btn && btn.classList.contains(activeClass)) return true; const target = Array.from(document.querySelectorAll(SEL_SIDE_BTNS)).find(b => b.innerText.includes(label)); if (target) { simulateExternalClick(target); await new Promise(r => setTimeout(r, 350)); } } return false; }
   function simulateExternalClick(el) { const opts = { bubbles: true, cancelable: true, view: window }; el.dispatchEvent(new MouseEvent('mouseenter', opts)); el.dispatchEvent(new MouseEvent('mousedown', opts)); el.focus(); el.dispatchEvent(new MouseEvent('mouseup', opts)); el.dispatchEvent(new MouseEvent('click', opts)); el.dispatchEvent(new MouseEvent('mouseleave', opts)); }
