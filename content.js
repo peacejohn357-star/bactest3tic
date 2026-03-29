@@ -43,7 +43,7 @@
   let signals = [], sessionTradesAll = [];
   let tickSeq = 0, lastSignalTickIndex = -999, upStreak = 0, downStreak = 0;
   let lastTickProcessedAt = 0, lastSignalEvalAt = 0, watchdogInterval = null, evalErrorCount = 0;
-  let realExecState = 'IDLE', realTrades = [], realOpenCount = 0, realWins = 0, realLosses = 0, realPnl = 0, realLockReason = '', lastRealTradeAt = 0, lastTradeClosedAt = 0, lastTradeClosedTick = -999, realExecTimer = null;
+  let realExecState = 'IDLE', realTrades = [], realOpenCount = 0, realWins = 0, realLosses = 0, realPnl = 0, realLockReason = '', lastRealTradeAt = 0, lastTradeClosedAt = 0, lastTradeClosedTick = -999, realExecTimer = null, lastSeenPnL = 0;
   let flyoutObserver = null, ws = null, wsState = 'disconnected', reconnectTimer = null, resolvedSymbol = null, manualClose = false, reconnectDelay = RECONNECT_BASE, failCount = 0, usingFallback = false;
 
   // UI Cache to prevent redundant DOM updates
@@ -304,13 +304,10 @@
       }
       lastUI.state = stateStr;
     }
-    if (lastUI.pnl !== realPnl) {
-      const pnlEl = document.getElementById('tt-real-pnl');
-      if (pnlEl) {
-        pnlEl.textContent = realPnl.toFixed(2);
-        pnlEl.style.color = realPnl >= 0 ? '#3ecf60' : '#e04040';
-      }
-      lastUI.pnl = realPnl;
+    const pnlEl = document.getElementById('tt-real-pnl');
+    if (pnlEl) {
+      pnlEl.textContent = realPnl.toFixed(2);
+      pnlEl.style.color = realPnl >= 0 ? '#3ecf60' : '#e04040';
     }
     updateWinsLossesUI();
   }
@@ -336,12 +333,10 @@
   function setupFlyoutObserver() {
     if (flyoutObserver) return;
     flyoutObserver = new MutationObserver((mutations) => {
-      // Filter out mutations that happen inside our own overlay to prevent infinite loops
       const hasPlatformMutation = mutations.some(m => {
         let node = m.target;
-        if (node.nodeType === 3) node = node.parentElement; // Text node -> Element
-        if (!node || node.id === 'tt-overlay' || node.closest?.('#tt-overlay')) return false;
-        return true;
+        if (node.nodeType === 3) node = node.parentElement;
+        return node && node.id !== 'tt-overlay' && !node.closest?.('#tt-overlay');
       });
       if (!hasPlatformMutation) return;
 
@@ -349,19 +344,28 @@
       if (!flyout) {
         if (realOpenCount !== 0) {
           realOpenCount = 0;
-          updateRealExecStateFromDOM(0, null);
+          updateRealExecStateFromDOM(0, { pnl: lastSeenPnL, result: lastSeenPnL >= 0 ? 'WIN' : 'LOSS' });
         }
         return;
       }
 
       const text = flyout.textContent;
+      // Track real-time PnL from the flyout while trade is open
+      const livePnlMatch = text.match(/Total\s+profit\/loss\s+([+-]?\d+\.?\d*)/i) || text.match(/Profit\/Loss\s+([+-]?\d+\.?\d*)/i);
+      if (livePnlMatch) lastSeenPnL = parseFloat(livePnlMatch[1]);
+
       let count = text.includes('no open positions') ? 0 : (text.match(/(\d+)\s+open\s+position/i) ? parseInt(text.match(/(\d+)\s+open\s+position/i)[1], 10) : realOpenCount);
       let closedResult = null;
-      const pnlMatch = text.match(/Closed\s+([+-]?\d+\.?\d*)\s+USD/i);
-      if (pnlMatch) {
-        closedResult = { pnl: parseFloat(pnlMatch[1]), result: parseFloat(pnlMatch[1]) >= 0 ? 'WIN' : 'LOSS' };
+
+      // Look for final settlement message
+      const pnlMatch = text.match(/Closed\s+([+-]?\d+\.?\d*)/i) || text.match(/Contract\s+value:\s+0\.00/i) ? { pnl: lastSeenPnL, result: lastSeenPnL >= 0 ? 'WIN' : 'LOSS' } : null;
+      if (text.includes('Closed') && text.match(/([+-]?\d+\.?\d*)\s+USD/i)) {
+        const val = parseFloat(text.match(/([+-]?\d+\.?\d*)\s+USD/i)[1]);
+        closedResult = { pnl: val, result: val >= 0 ? 'WIN' : 'LOSS' };
+      } else if (pnlMatch) {
+        closedResult = pnlMatch;
       } else if (text.includes('no open positions') && realExecState === 'OPEN') {
-        closedResult = { pnl: 0, result: 'UNKNOWN' };
+        closedResult = { pnl: lastSeenPnL, result: lastSeenPnL >= 0 ? 'WIN' : 'LOSS' };
       }
 
       if (count !== realOpenCount || closedResult) {
@@ -372,32 +376,73 @@
     flyoutObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
   }
   function updateRealExecStateFromDOM(count, closedResult) {
-    if (closedResult && ['OPEN', 'OPEN_PENDING', 'RECOVERY'].includes(realExecState)) { finalizeRealTrade(closedResult); realExecState = 'IDLE'; realLockReason = ''; }
-    else if (count === 0 && ['OPEN', 'RECOVERY'].includes(realExecState)) { finalizeRealTrade({ pnl: 0, result: 'UNKNOWN' }); realExecState = 'IDLE'; realLockReason = ''; }
-    if (count > 0 && ['IDLE', 'OPEN_PENDING'].includes(realExecState)) { realExecState = 'OPEN'; const pending = signals.find(s => s.result === 'PENDING' && !s.entryPriceReal); if (pending && ticks.length) { pending.entryPriceReal = ticks[ticks.length - 1].price; updateSignalsUI(); } } updateRealUI();
+    if (closedResult && (realExecState === 'OPEN' || realExecState === 'OPEN_PENDING' || realExecState === 'RECOVERY')) {
+      finalizeRealTrade(closedResult);
+      realExecState = 'IDLE';
+      realLockReason = '';
+    } else if (count === 0 && (realExecState === 'OPEN' || realExecState === 'RECOVERY')) {
+      finalizeRealTrade({ pnl: lastSeenPnL, result: lastSeenPnL >= 0 ? 'WIN' : 'LOSS' });
+      realExecState = 'IDLE';
+      realLockReason = '';
+    }
+    if (count > 0 && ['IDLE', 'OPEN_PENDING'].includes(realExecState)) {
+      realExecState = 'OPEN';
+      lastSeenPnL = 0;
+      const pending = signals.find(s => s.result === 'PENDING' && !s.entryPriceReal);
+      if (pending && ticks.length) {
+        pending.entryPriceReal = ticks[ticks.length - 1].price;
+        updateSignalsUI();
+      }
+    }
+    updateRealUI();
   }
   function finalizeRealTrade(res) {
-    if (!realTrades.length) return; const last = realTrades[realTrades.length - 1]; if (last.result !== 'PENDING') return;
-    last.result = res.result; last.pnl = res.pnl; if (res.result === 'WIN') realWins++; else if (res.result === 'LOSS') realLosses++; realPnl += res.pnl;
-    const simTrade = signals.find(s => s.result === 'PENDING'); if (simTrade) { simTrade.result = res.result; simTrade.priceAfter = ticks.length ? ticks[ticks.length - 1].price : simTrade.price; }
-    lastTradeClosedAt = Date.now(); lastTradeClosedTick = tickSeq; clearTimeout(realExecTimer); realExecTimer = null; updateRealUI(); updateSignalsUI();
+    if (!realTrades.length) return;
+    const last = realTrades[realTrades.length - 1];
+    if (last.result !== 'PENDING') return;
+    last.result = res.result;
+    last.pnl = res.pnl || 0;
+    if (res.result === 'WIN') realWins++;
+    else if (res.result === 'LOSS') realLosses++;
+    realPnl += last.pnl;
+    const simTrade = last.signalRef || signals.find(s => s.result === 'PENDING' && s.isReal);
+    if (simTrade) {
+      simTrade.result = res.result;
+      simTrade.priceAfter = ticks.length ? ticks[ticks.length - 1].price : simTrade.price;
+    }
+    lastTradeClosedAt = Date.now();
+    lastTradeClosedTick = tickSeq;
+    if (realExecTimer) { clearTimeout(realExecTimer); realExecTimer = null; }
+    updateRealUI();
+    updateSignalsUI();
   }
   async function executeRealTrade(side) {
     if (Date.now() - lastRealTradeAt < cfg.realCooldownMs) return;
     const buyLabel = side === 'BUY' ? 'Rise' : 'Fall', activeClass = side === 'BUY' ? CLASS_RISE_ACTIVE : CLASS_FALL_ACTIVE;
     try {
+      // Find signal first
+      const signalToMark = signals.find(s => s.result === 'PENDING' && s.isReal);
+
+      // Only proceed if we aren't already simulating a click (redundancy check)
       if (!await setRealTradeSide(buyLabel, activeClass)) throw new Error('side_failed');
       if (!await waitRealBuyReady()) throw new Error('not_ready');
-      const btn = document.querySelector(SEL_PURCHASE_BTN); if (!btn || !btn.classList.contains(activeClass)) throw new Error('btn_mismatch');
-      simulateExternalClick(btn); lastRealTradeAt = Date.now();
-      const signalToMark = signals.find(s => s.result === 'PENDING' && s.isReal);
+      const btn = document.querySelector(SEL_PURCHASE_BTN);
+      if (!btn || !btn.classList.contains(activeClass)) throw new Error('btn_mismatch');
+
+      simulateExternalClick(btn);
+      lastRealTradeAt = Date.now();
+
       realTrades.push({ time: Date.now(), signal: side, side: buyLabel, result: 'PENDING', signalRef: signalToMark });
       realExecTimer = setTimeout(() => { if (['OPEN_PENDING', 'OPEN'].includes(realExecState)) { realExecState = 'RECOVERY'; realLockReason = 'TIMEOUT'; updateRealUI(); } }, cfg.realTimeoutMs);
-    } catch (e) { realLockReason = 'ERR:' + e.message; updateRealUI(); setTimeout(() => { if (realExecState === 'OPEN_PENDING') { realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); } }, 3000); }
+    } catch (e) {
+      realLockReason = 'ERR:' + e.message;
+      updateRealUI();
+      setTimeout(() => { if (realExecState === 'OPEN_PENDING') { realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); } }, 3000);
+    }
   }
   async function setRealTradeSide(label, activeClass) { for (let i = 0; i < 3; i++) { await new Promise(r => setTimeout(r, 150)); const btn = document.querySelector(SEL_PURCHASE_BTN); if (btn && btn.classList.contains(activeClass)) return true; const target = Array.from(document.querySelectorAll(SEL_SIDE_BTNS)).find(b => b.innerText.includes(label)); if (target) { simulateExternalClick(target); await new Promise(r => setTimeout(r, 350)); } } return false; }
   function simulateExternalClick(el) { const opts = { bubbles: true, cancelable: true, view: window }; el.dispatchEvent(new MouseEvent('mouseenter', opts)); el.dispatchEvent(new MouseEvent('mousedown', opts)); el.focus(); el.dispatchEvent(new MouseEvent('mouseup', opts)); el.dispatchEvent(new MouseEvent('click', opts)); el.dispatchEvent(new MouseEvent('mouseleave', opts)); }
   async function waitRealBuyReady() { for (let i = 0; i < 5; i++) { const btn = document.querySelector(SEL_PURCHASE_BTN); if (btn && btn.getAttribute('data-loading') !== 'true' && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') return true; await new Promise(r => setTimeout(r, 300)); } return false; }
-  function init() { if (document.getElementById('tt-overlay')) return; cfg = loadCfg(); buildOverlay(); connect(); startWatchdog(); setupFlyoutObserver(); }
+  function init() { if (document.getElementById('tt-overlay')) return; cfg = loadCfg(); buildOverlay(); connect(); startWatchdog(); setupFlyoutObserver(); window._tt_cfg = cfg; window._tt_detect = detectSignal; }
   if (document.body) init(); else document.addEventListener('DOMContentLoaded', init);
 })();
