@@ -213,16 +213,10 @@
 
     try { detectSignal(); lastSignalEvalAt = Date.now(); } catch (e) { evalErrorCount++; }
 
-    // Automatic Signal Settlement (3-Tick Logic for Simulation)
+    // Update pending signals for simulation/logging
     signals.forEach(sig => {
       if (sig.result === 'PENDING') {
         sig.ticksAfter.push(price);
-        if (sig.ticksAfter.length >= 3 && !sig.isReal) {
-          const entry = sig.price, exit = price;
-          sig.result = (sig.type === 'BUY' && exit >= entry) || (sig.type === 'SELL' && exit <= entry) ? 'WIN' : 'LOSS';
-          if (sig.result === 'WIN') realWins++; else realLosses++;
-          updateSignalsUI(); updateWinsLossesUI();
-        }
       }
     });
   }
