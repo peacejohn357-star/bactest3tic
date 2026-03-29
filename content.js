@@ -57,11 +57,11 @@
     el.innerHTML = `
       <div id="tt-header">
         <span class="tt-title">3Tick Timing V2</span>
-        <div class="tt-header-btns"><button id="tt-min-btn" title="Minimise">_</button><button id="tt-close-btn" title="Close">✕</button></div>
+        <div class="tt-header-btns"><button id="tt-min-btn" title="Minimise">_</button><button id="tt-close-btn" title="Close">X</button></div>
       </div>
       <div id="tt-body">
         <div class="tt-row"><span class="tt-label">Status</span><span class="tt-val" id="tt-status">Disconnected</span></div>
-        <div class="tt-row"><span class="tt-label">Last Price</span><span class="tt-val" id="tt-price">–</span></div>
+        <div class="tt-row"><span class="tt-label">Last Price</span><span class="tt-val" id="tt-price">-</span></div>
         <div class="tt-row"><span class="tt-label">S_Low / S_High</span><span class="tt-val" id="tt-speed-stats">0.00 / 0.00</span></div>
         <div class="tt-row"><span class="tt-label">Mean / Std</span><span class="tt-val" id="tt-speed-dist">0.00 / 0.00</span></div>
         <div class="tt-row"><span class="tt-label">Session W/L</span><span class="tt-val"><span id="tt-wins">0</span> / <span id="tt-losses">0</span></span></div>
@@ -70,10 +70,10 @@
         <div id="tt-real-panel">
           <div class="tt-row"><span class="tt-label">Exec State</span><span class="tt-val" id="tt-real-state">IDLE</span></div>
           <div class="tt-row"><span class="tt-label">Real PnL</span><span class="tt-val" id="tt-real-pnl">0.00</span></div>
-          <button id="tt-real-export">⬇ Export Real CSV</button>
+          <button id="tt-real-export">Download Real CSV</button>
           <button id="tt-real-reset" style="background:#3d1a1a;color:#e04040;margin-top:2px;">Reset Engine</button>
         </div>
-        <button id="tt-config-toggle">⚙ settings</button>
+        <button id="tt-config-toggle">Settings</button>
         <div id="tt-config">
           <div class="tt-config-row"><label>Mode</label><select id="tt-cfg-strategy-mode"><option value="structural">Structural</option><option value="hybrid">Hybrid</option><option value="momentum">Momentum</option><option value="reversal">Reversal</option></select></div>
           <div class="tt-config-row"><label>Epsilon</label><input type="number" id="tt-cfg-epsilon" min="0" max="1" step="0.01" value="0.2"></div>
@@ -81,7 +81,7 @@
           <div class="tt-config-section-label">Real Trade Master</div>
           <div class="tt-config-row"><label style="color:#f0a060;font-weight:700;">Enable Real Execution</label><label class="tt-switch"><input type="checkbox" id="tt-cfg-real-enabled"><span class="tt-slider"></span></label></div>
         </div>
-        <button id="tt-export">⬇ Export CSV</button>
+        <button id="tt-export">Download Signals CSV</button>
       </div>
       <div id="tt-alert"></div>
     `;
@@ -212,7 +212,13 @@
     }
 
     try { detectSignal(); lastSignalEvalAt = Date.now(); } catch (e) { evalErrorCount++; }
-    signals.forEach(sig => { if (sig.result === 'PENDING') sig.ticksAfter.push(price); });
+
+    // Update pending signals for simulation/logging
+    signals.forEach(sig => {
+      if (sig.result === 'PENDING') {
+        sig.ticksAfter.push(price);
+      }
+    });
   }
 
   // ── Signal Detection Logic (Final Corrected Model) ────────────────────────
@@ -258,7 +264,7 @@
         if (currentTickIndex - lastSignalTickIndex < cfg.postTradeCooldownTicks || Date.now() - lastTradeClosedAt < cfg.postTradeCooldownMs || realExecState !== 'IDLE') return null;
         lastSignalTickIndex = currentTickIndex;
         let conf = res.conf; if ((res.type === 'BUY' && !buyDigitBias) || (res.type === 'SELL' && !sellDigitBias)) conf -= 10;
-        const sig = { type: res.type, price: t0.price, time: t0.epoch, result: 'PENDING', ticksAfter: [], confidence: Math.min(100, conf), strategy: mode };
+        const sig = { type: res.type, price: t0.price, time: t0.epoch, result: 'PENDING', ticksAfter: [], confidence: Math.min(100, conf), strategy: mode, isReal: cfg.realTradeEnabled };
         signals.push(sig); if (signals.length > 50) signals.shift(); recordSessionTrade(sig); updateSignalsUI();
         if (cfg.realTradeEnabled) { realExecState = 'OPEN_PENDING'; realLockReason = 'EXECUTING'; updateRealUI(); executeRealTrade(res.type); }
       }
@@ -283,7 +289,7 @@
     const el = document.getElementById('tt-signals-list'); if (!el) return;
     el.innerHTML = ''; signals.slice(-10).reverse().forEach(sig => {
       const div = document.createElement('div'); div.className = `tt-signal tt-signal-${sig.type.toLowerCase()}`;
-      const badge = sig.result === 'WIN' ? '<span class="tt-badge tt-badge-win">WIN</span>' : sig.result === 'LOSS' ? '<span class="tt-badge tt-badge-loss">LOSS</span>' : '<span class="tt-badge tt-badge-pending">…</span>';
+      const badge = sig.result === 'WIN' ? '<span class="tt-badge tt-badge-win">WIN</span>' : sig.result === 'LOSS' ? '<span class="tt-badge tt-badge-loss">LOSS</span>' : '<span class="tt-badge tt-badge-pending">...</span>';
       div.innerHTML = `<span class="tt-signal-type">${sig.type}</span><span class="tt-signal-price">${(sig.entryPriceReal || sig.price).toFixed(2)}</span><span class="tt-signal-time">${new Date(sig.time*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})} [${sig.confidence}%]</span>${badge}`;
       el.appendChild(div);
     });
@@ -374,7 +380,7 @@
     if (!realTrades.length) return; const last = realTrades[realTrades.length - 1]; if (last.result !== 'PENDING') return;
     last.result = res.result; last.pnl = res.pnl; if (res.result === 'WIN') realWins++; else if (res.result === 'LOSS') realLosses++; realPnl += res.pnl;
     const simTrade = signals.find(s => s.result === 'PENDING'); if (simTrade) { simTrade.result = res.result; simTrade.priceAfter = ticks.length ? ticks[ticks.length - 1].price : simTrade.price; }
-    lastTradeClosedAt = Date.now(); lastTradeClosedTick = tickSeq; clearTimeout(realExecTimer); realExecTimer = null; updateRealUI();
+    lastTradeClosedAt = Date.now(); lastTradeClosedTick = tickSeq; clearTimeout(realExecTimer); realExecTimer = null; updateRealUI(); updateSignalsUI();
   }
   async function executeRealTrade(side) {
     if (Date.now() - lastRealTradeAt < cfg.realCooldownMs) return;
@@ -383,7 +389,9 @@
       if (!await setRealTradeSide(buyLabel, activeClass)) throw new Error('side_failed');
       if (!await waitRealBuyReady()) throw new Error('not_ready');
       const btn = document.querySelector(SEL_PURCHASE_BTN); if (!btn || !btn.classList.contains(activeClass)) throw new Error('btn_mismatch');
-      simulateExternalClick(btn); lastRealTradeAt = Date.now(); realTrades.push({ time: Date.now(), signal: side, side: buyLabel, result: 'PENDING' });
+      simulateExternalClick(btn); lastRealTradeAt = Date.now();
+      const signalToMark = signals.find(s => s.result === 'PENDING' && s.isReal);
+      realTrades.push({ time: Date.now(), signal: side, side: buyLabel, result: 'PENDING', signalRef: signalToMark });
       realExecTimer = setTimeout(() => { if (['OPEN_PENDING', 'OPEN'].includes(realExecState)) { realExecState = 'RECOVERY'; realLockReason = 'TIMEOUT'; updateRealUI(); } }, cfg.realTimeoutMs);
     } catch (e) { realLockReason = 'ERR:' + e.message; updateRealUI(); setTimeout(() => { if (realExecState === 'OPEN_PENDING') { realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); } }, 3000); }
   }
