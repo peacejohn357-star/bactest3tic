@@ -1,6 +1,6 @@
 # 3Tick Scalper – Step Index 100 Assistant
 
-A Chrome extension that overlays a real-time trading assistant on [dtrader.deriv.com](https://dtrader.deriv.com) for **Step Index 100** manual scalping using 3-tick contract logic.
+A Chrome extension that overlays a real-time trading assistant on [dtrader.deriv.com](https://dtrader.deriv.com) for **Step Index 100** manual and automated scalping using 3-tick micro-timing logic.
 
 ---
 
@@ -8,15 +8,38 @@ A Chrome extension that overlays a real-time trading assistant on [dtrader.deriv
 
 | Feature | Details |
 |---|---|
-| **Live tick feed** | Streams Step Index 100 ticks via the public Deriv WebSocket (`wss://ws.deriv.com/websockets/v3?app_id=1089`). Buffers the latest 200 ticks. |
-| **1-minute candle feed** | Subscribes to 1-min candles and buffers the latest 200. Auto-reconnects on disconnect. |
-| **3-tick signal detection** | Detects spike → reversal patterns (configurable spike % threshold and reversal-tick count) and fires BUY / SELL alerts. |
-| **Win / Loss tracking** | Scores each signal after 3 ticks and updates session W / L counters in real time. |
-| **S/R zones** | Scans a rolling window of recent candles for local high / low extrema and displays the top Resistance and Support levels. |
-| **1-min trend indicator** | Reads the last 3 closed candles and shows ▲ Up / ▼ Down / ↔ Side. |
-| **Draggable overlay** | Floating panel on the chart page; position is saved to `localStorage`. Minimise or close with header buttons. |
-| **CSV export** | One-click export of all signals (type, entry, time, result, exit price) as a `.csv` file. |
-| **Settings panel** | Adjust spike-% threshold and reversal-tick count without reloading. |
+| **Micro-Timing Engine** | Streams Step Index 100 ticks via the public Deriv WebSocket and calculates real-time microstructure features (normalized speed, speed trend, streaks, delta change, and last digits). |
+| **Adaptive Speed Bands** | Uses a 100-tick rolling buffer to calculate dynamic $S_{high}$ and $S_{low}$ thresholds using a hybrid of 70th/30th percentiles and Standard Deviation ($mean \pm std$). |
+| **4 Advanced Strategies** | Includes **Structural** (base layer), **Hybrid** (optimal balance), **Momentum** (early entry), and **Reversal** (exhaustion) logic. |
+| **Peak Speed Prevention** | Momentum strategy detects acceleration and enters *before* price reaches peak speed ($S_{high}$) to maximize 3-tick window efficiency. |
+| **No-Trade Filters** | Global filters block entries during transition streak zones (3-4), neutral momentum (within 0.2 step epsilon), or flat mid-range trends. |
+| **Real Execution** | Master toggle to enable automated clicking of "Rise"/"Fall" and "Purchase" buttons with robust state management and outcome tracking via DOM observation. |
+| **Draggable Overlay** | Floating statistics panel showing real-time price, speed distribution, strategy confidence, and session W/L performance. |
+| **CSV Export** | Export signal history and real-trade execution logs for performance analysis. |
+
+---
+
+## How signals work (Mathematical Model)
+
+1. **Feature Extraction**
+   - **Speed**: $delta\_steps / delta\_time\_ms$ (where 1 step = 0.1 price units).
+   - **Speed Trend**: Change in absolute speed (Acceleration vs. Deceleration).
+   - **Streaks**: Consecutive ticks in the same direction.
+   - **Epsilon**: Neutral momentum zone defined as $\pm 0.2$ steps.
+
+2. **Adaptive Thresholds**
+   - $S_{high} = \max(p70, mean + std)$
+   - $S_{low} = \min(p30, mean - std)$
+
+3. **Strategy Hierachy**
+   - **Structural**: Enters on digit-set bias ({0,5,6} for BUY, {2,3,8} for SELL) aligned with delta change.
+   - **Hybrid**: Combines digit bias with momentum timing and early-streak confirmation.
+   - **Momentum**: Targets start of move. Requires Early Streak (0-2), positive speed trend, and speed *below* $S_{high}$.
+   - **Reversal**: Targets exhaustion. Requires Late Streak ($\ge 5$), negative speed trend, and speed *at or below* $S_{low}$.
+
+4. **Scoring & Bias**
+   - Price last digits act as a **bias filter/boost**, increasing or decreasing signal confidence.
+   - Signals are evaluated in order of priority: Structural $\to$ Hybrid $\to$ Momentum $\to$ Reversal.
 
 ---
 
@@ -25,59 +48,9 @@ A Chrome extension that overlays a real-time trading assistant on [dtrader.deriv
 1. **Download / clone this repository.**
 2. Open Chrome and go to `chrome://extensions`.
 3. Enable **Developer mode** (toggle in the top-right corner).
-4. Click **Load unpacked** and select the repository folder (the one containing `manifest.json`).
-5. Navigate to [https://dtrader.deriv.com](https://dtrader.deriv.com).  
-   The **3Tick Scalper** panel appears in the top-right corner of the page.
-
-> **Note:** The extension runs only on `https://dtrader.deriv.com/*` and does not require any Deriv login or private API key.
-
----
-
-## File structure
-
-```
-3tick/
-├── manifest.json   Chrome extension manifest (Manifest V3)
-├── content.js      Content script – WebSocket, signal logic, overlay UI
-├── styles.css      Overlay CSS
-└── README.md       This file
-```
-
----
-
-## How signals work
-
-1. **Spike detection** – when the price moves ≥ `spikeThreshold` % in a single tick, a spike is recorded.  
-2. **Reversal confirmation** – if the next `reversalTicks` ticks move in the *opposite* direction, a signal is fired.  
-   - Spike **up** then reversal ticks **down** → **SELL**  
-   - Spike **down** then reversal ticks **up** → **BUY**  
-3. **Scoring** – after 3 more ticks the entry price is compared with the 3rd-tick price using integer tick units (`Math.round(price / tickSize)`) to avoid floating-point noise:  
-   - BUY: exitTicks ≥ entryTicks → **WIN**, else **LOSS** (equality counts as WIN)  
-   - SELL: exitTicks ≤ entryTicks → **WIN**, else **LOSS** (equality counts as WIN)
-
----
-
-## Customising
-
-All thresholds can be tweaked in the **⚙ settings** panel inside the overlay, or by editing the `cfg` object at the top of `content.js`:
-
-```js
-let cfg = {
-  spikeThreshold: 0.30,  // minimum % price-move to call a spike
-  reversalTicks:  1,     // consecutive opposite-direction ticks to confirm reversal
-};
-```
-
-To change the Deriv `app_id`, edit the `WS_URL` constant near the top of `content.js`.
-
----
-
-## Cautions / rate-limit notes
-
-- Only **one WebSocket** is opened at a time; it is reused for both tick and candle subscriptions.
-- The extension never issues more than two `subscribe` calls per connection (ticks + candles).
-- Reconnection uses a fixed 4-second back-off to avoid hammering the server.
-- No private API methods are used; all data comes from the public feed.
+4. Click **Load unpacked** and select the repository folder.
+5. Navigate to [https://dtrader.deriv.com](https://dtrader.deriv.com).
+   The **3Tick Timing V2** panel appears in the top-right corner.
 
 ---
 
