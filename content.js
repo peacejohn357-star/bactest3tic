@@ -261,10 +261,28 @@
       return null;
     };
     const checkStructural2 = () => {
-      // Primary Recommendation: UP + ACCEL + {6,7}
-      if (t0.direction === 1 && t0.deltaChange > 0 && [6, 7].includes(t0.lastDigit)) return { type: 'BUY', conf: 85 };
-      // Secondary logic from Dataset: DOWN + ACCEL + {3,4}
-      if (t0.direction === -1 && t0.deltaChange < 0 && [3, 4].includes(t0.lastDigit)) return { type: 'SELL', conf: 80 };
+      const tMinus1 = n >= 2 ? ticks[n - 2] : null;
+      if (!tMinus1) return null;
+
+      // "Calm Before the Storm" Timing Check: ~1000ms delay, avoid spikes < 500ms
+      // Both Setup (T-1) and Trigger (T0) should be in the "Steady" timing zone (avg 1032ms and 991ms)
+      const isCalm = (tMinus1.deltaTime >= 500 && tMinus1.deltaTime <= 1500) &&
+                     (t0.deltaTime >= 500 && t0.deltaTime <= 1500);
+      if (!isCalm) return null;
+
+      // BUY DNA (Catching 5+ UP Streaks)
+      // SETUP (T-1): Normal Speed + Digit 2, 5, or 9
+      // TRIGGER (T0): Direction Flip (DOWN->UP) + Accel 2.0
+      if (t0.direction === 1 && tMinus1.direction === -1 && Math.abs(t0.deltaChange - 2.0) < 0.01) {
+        if ([2, 5, 9].includes(tMinus1.lastDigit)) return { type: 'BUY', conf: 90 };
+      }
+
+      // SELL DNA (Catching 5+ DOWN Streaks)
+      // SETUP (T-1): Normal Speed + Digit 9 or 6
+      // TRIGGER (T0): Direction Flip (UP->DOWN) + Accel -2.0
+      if (t0.direction === -1 && tMinus1.direction === 1 && Math.abs(t0.deltaChange + 2.0) < 0.01) {
+        if ([9, 6].includes(tMinus1.lastDigit)) return { type: 'SELL', conf: 90 };
+      }
       return null;
     };
 
@@ -278,7 +296,7 @@
 
     if (res) {
       // Global NO-TRADE filters (Removed streak 3,4 blocking as per latest data)
-      if (Math.abs(t0.deltaChange) < eps || (t0.absSpeed > sLow && t0.absSpeed < sHigh && Math.abs(t0.speedTrend) < 0.001)) res = null;
+      if (Math.abs(t0.deltaChange) < eps) res = null;
       if (res) {
         const currentTickIndex = tickSeq;
         if (currentTickIndex - lastSignalTickIndex < cfg.postTradeCooldownTicks || Date.now() - lastTradeClosedAt < cfg.postTradeCooldownMs || realExecState !== 'IDLE') return null;
