@@ -47,7 +47,7 @@
   let flyoutObserver = null, ws = null, wsState = 'disconnected', reconnectTimer = null, resolvedSymbol = null, manualClose = false, reconnectDelay = RECONNECT_BASE, failCount = 0, usingFallback = false;
 
   // UI Cache to prevent redundant DOM updates
-  let lastUI = { state: '', pnl: null, wins: -1, losses: -1, price: '', stats: '', dist: '' };
+  let lastUI = { state: '', pnl: null, wins: -1, losses: -1, price: '', stats: '', dist: '', dirStreak: '' };
 
   // ── Overlay Build ─────────────────────────────────────────────────────────
   function buildOverlay() {
@@ -62,6 +62,7 @@
       <div id="tt-body">
         <div class="tt-row"><span class="tt-label">Status</span><span class="tt-val" id="tt-status">Disconnected</span></div>
         <div class="tt-row"><span class="tt-label">Last Price</span><span class="tt-val" id="tt-price">-</span></div>
+        <div class="tt-row"><span class="tt-label">Dir / Streak</span><span class="tt-val" id="tt-dir-streak">- / 0</span></div>
         <div class="tt-row"><span class="tt-label">S_Low / S_High</span><span class="tt-val" id="tt-speed-stats">0.00 / 0.00</span></div>
         <div class="tt-row"><span class="tt-label">Mean / Std</span><span class="tt-val" id="tt-speed-dist">0.00 / 0.00</span></div>
         <div class="tt-row"><span class="tt-label">Session W/L</span><span class="tt-val"><span id="tt-wins">0</span> / <span id="tt-losses">0</span></span></div>
@@ -211,6 +212,17 @@
       lastUI.price = priceStr;
     }
 
+    const dirStr = direction === 1 ? 'UP' : (direction === -1 ? 'DOWN' : 'FLAT');
+    const streakStr = `${dirStr} / ${Math.max(upStreak, downStreak)}`;
+    if (lastUI.dirStreak !== streakStr) {
+      const el = document.getElementById('tt-dir-streak');
+      if (el) {
+        el.textContent = streakStr;
+        el.style.color = direction === 1 ? '#3ecf60' : (direction === -1 ? '#e04040' : '#fff');
+      }
+      lastUI.dirStreak = streakStr;
+    }
+
     try { detectSignal(); lastSignalEvalAt = Date.now(); } catch (e) { evalErrorCount++; }
 
     // Update pending signals for simulation/logging
@@ -225,8 +237,8 @@
   function detectSignal() {
     const n = ticks.length; if (n < 2) return null;
     const t0 = ticks[n - 1], mode = cfg.strategyMode, eps = cfg.epsilon;
-    const streak = Math.max(t0.upStreak, t0.downStreak), isEarly = streak <= 2, isLate = streak >= 5;
-    const buyDigits = [0, 5, 6], sellDigits = [2, 3, 8], buyDigitBias = buyDigits.includes(t0.lastDigit), sellDigitBias = sellDigits.includes(t0.lastDigit);
+    const streak = Math.max(t0.upStreak, t0.downStreak), isEarly = streak <= 2, isLate = streak >= 4;
+    const buyDigits = [0, 5, 6, 7], sellDigits = [2, 3, 4, 8], buyDigitBias = buyDigits.includes(t0.lastDigit), sellDigitBias = sellDigits.includes(t0.lastDigit);
 
     const checkStructural = () => {
       if (buyDigitBias && t0.deltaChange > eps) return { type: 'BUY', conf: 70 };
@@ -249,8 +261,10 @@
       return null;
     };
     const checkStructural2 = () => {
-      if (t0.direction === 1 && t0.deltaChange > 0 && [6, 7].includes(t0.lastDigit)) return { type: 'BUY', conf: 80 };
-      if (t0.direction === -1 && t0.deltaChange < 0 && [3, 4].includes(t0.lastDigit)) return { type: 'SELL', conf: 75 };
+      // Primary Recommendation: UP + ACCEL + {6,7}
+      if (t0.direction === 1 && t0.deltaChange > 0 && [6, 7].includes(t0.lastDigit)) return { type: 'BUY', conf: 85 };
+      // Secondary logic from Dataset: DOWN + ACCEL + {3,4}
+      if (t0.direction === -1 && t0.deltaChange < 0 && [3, 4].includes(t0.lastDigit)) return { type: 'SELL', conf: 80 };
       return null;
     };
 
@@ -263,8 +277,8 @@
     else if (mode === 'reversal') res = checkReversal();
 
     if (res) {
-      // Global NO-TRADE filters
-      if ([3, 4].includes(streak) || Math.abs(t0.deltaChange) < eps || (t0.absSpeed > sLow && t0.absSpeed < sHigh && Math.abs(t0.speedTrend) < 0.001)) res = null;
+      // Global NO-TRADE filters (Removed streak 3,4 blocking as per latest data)
+      if (Math.abs(t0.deltaChange) < eps || (t0.absSpeed > sLow && t0.absSpeed < sHigh && Math.abs(t0.speedTrend) < 0.001)) res = null;
       if (res) {
         const currentTickIndex = tickSeq;
         if (currentTickIndex - lastSignalTickIndex < cfg.postTradeCooldownTicks || Date.now() - lastTradeClosedAt < cfg.postTradeCooldownMs || realExecState !== 'IDLE') return null;
