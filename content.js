@@ -418,7 +418,13 @@
       // Track real-time PnL from the flyout while trade is open
       // Use specific selectors if possible, otherwise regex on innerText
       const pnlEl = flyout.querySelector('.dc-contract-card__profit-loss-label, .dc-status-colored-text, .dc-contract-card-item__body--profit span[data-testid="dt_span"], .dc-contract-card-item__body--loss span[data-testid="dt_span"]');
-      if (pnlEl) {
+      const profitValEl = flyout.querySelector('.dc-contract-card-item__body--profit span[data-testid="dt_span"]');
+      const lossValEl = flyout.querySelector('.dc-contract-card-item__body--loss span[data-testid="dt_span"]');
+
+      if (profitValEl || lossValEl) {
+        const val = parseFloat((profitValEl || lossValEl).innerText.replace(/[^-0-9.]/g, ''));
+        if (!isNaN(val)) lastSeenPnL = val;
+      } else if (pnlEl) {
         const val = parseFloat(pnlEl.innerText.replace(/[^-0-9.]/g, ''));
         if (!isNaN(val)) lastSeenPnL = val;
       } else {
@@ -439,7 +445,8 @@
       const isDefiniteLoss = hasLossClass || /Contract\s+value:\s*0\.00/i.test(text) || /Loss/i.test(text) || lastSeenPnL < 0 || (lastSeenPnL === 0 && !isDefiniteWin);
 
       // Detection of terminal state
-      const isClosed = text.includes('Closed') || /Contract\s+value:\s*0\.00/i.test(text) || text.includes('Total profit/loss');
+      // 'Total profit/loss' is present while open, so only use it if 'Closed' or '0.00' is also present
+      const isClosed = text.includes('Closed') || /Contract\s+value:\s*0\.00/i.test(text);
 
       if (isClosed) {
         closedResult = { pnl: lastSeenPnL, result: isDefiniteWin ? 'WIN' : 'LOSS' };
@@ -459,6 +466,7 @@
       realLockReason = '';
       lastSeenPnL = 0;
     } else if (count === 0 && (realExecState === 'OPEN' || realExecState === 'RECOVERY')) {
+      // Final fallback if flyout disappears and we didn't catch a closed result
       finalizeRealTrade({ pnl: lastSeenPnL, result: lastSeenPnL > 0 ? 'WIN' : 'LOSS' });
       realExecState = 'IDLE';
       realLockReason = '';
