@@ -280,10 +280,10 @@
       }
 
       // SELL DNA (Catching 5+ DOWN Streaks)
-      // SETUP (T-1): Normal Speed + Digit 9 or 6
+      // SETUP (T-1): Normal Speed + Digit 6
       // TRIGGER (T0): Direction Flip (UP->DOWN) + Accel -2.0
       if (t0.direction === -1 && tMinus1.direction === 1 && t0.deltaChange === -2) {
-        if ([9, 6].includes(tMinus1.lastDigit)) {
+        if (tMinus1.lastDigit === 6) {
           return { type: 'SELL', conf: 90, triggerDigit: tMinus1.lastDigit, triggerDesc: 'Flip+Accel(-2.0)' };
         }
       }
@@ -386,19 +386,21 @@
   function loadCfg() { const stored = safeStorage('get', 'tt-cfg'); return Object.assign({ strategyMode: 'hybrid', epsilon: 0.2, realTradeEnabled: false, realTimeoutMs: 40000, realCooldownMs: 5000, postTradeCooldownTicks: 5, postTradeCooldownMs: 5000, debugSignals: true }, stored || {}); }
   function applyConfigToUI() { const dbg = document.getElementById('tt-cfg-debug'), re = document.getElementById('tt-cfg-real-enabled'), mode = document.getElementById('tt-cfg-strategy-mode'), eps = document.getElementById('tt-cfg-epsilon'); if (dbg) dbg.checked = cfg.debugSignals; if (re) re.checked = !!cfg.realTradeEnabled; if (mode) mode.value = cfg.strategyMode; if (eps) eps.value = cfg.epsilon; updateRealUI(); }
   function startWatchdog() { if (watchdogInterval) clearInterval(watchdogInterval); watchdogInterval = setInterval(() => { const now = Date.now(); if (wsState !== 'connected') return; if (lastTickProcessedAt > 0 && now - lastTickProcessedAt > WATCHDOG_TICK_TIMEOUT) { if (ws) ws.close(); scheduleReconnect(); } }, WATCHDOG_INTERVAL); }
-  let subObserver = null;
+  let subObserver = null, lastFlyoutNode = null;
   function setupFlyoutObserver() {
     if (flyoutObserver) return;
-    flyoutObserver = new MutationObserver((mutations) => {
+    flyoutObserver = new MutationObserver(() => {
       const flyout = document.querySelector(SEL_FLYOUT);
       if (flyout) {
-        if (!subObserver) {
+        if (flyout !== lastFlyoutNode) {
+          if (subObserver) subObserver.disconnect();
+          lastFlyoutNode = flyout;
           subObserver = new MutationObserver(() => processFlyout(flyout));
           subObserver.observe(flyout, { childList: true, subtree: true, characterData: true });
           processFlyout(flyout);
         }
       } else {
-        if (subObserver) { subObserver.disconnect(); subObserver = null; }
+        if (subObserver) { subObserver.disconnect(); subObserver = null; lastFlyoutNode = null; }
         if (realOpenCount !== 0) {
           realOpenCount = 0;
           updateRealExecStateFromDOM(0, { pnl: lastSeenPnL, result: lastSeenPnL > 0 ? 'WIN' : 'LOSS' });
@@ -415,7 +417,7 @@
 
       // Track real-time PnL from the flyout while trade is open
       // Use specific selectors if possible, otherwise regex on innerText
-      const pnlEl = flyout.querySelector('.dc-contract-card__profit-loss-label, .dc-status-colored-text');
+      const pnlEl = flyout.querySelector('.dc-contract-card__profit-loss-label, .dc-status-colored-text, .dc-contract-card-item__body--profit span[data-testid="dt_span"], .dc-contract-card-item__body--loss span[data-testid="dt_span"]');
       if (pnlEl) {
         const val = parseFloat(pnlEl.innerText.replace(/[^-0-9.]/g, ''));
         if (!isNaN(val)) lastSeenPnL = val;
@@ -431,12 +433,15 @@
       let closedResult = null;
 
       // EXPLICIT WIN/LOSS DETECTION
+      // Definite Win: Profit class or positive lastSeenPnL
+      const isDefiniteWin = (hasProfitClass && lastSeenPnL > 0) || lastSeenPnL > 0;
       // Definite Loss: Contract value 0.00, Loss class, "Loss" text, or NEGATIVE lastSeenPnL
-      const isDefiniteLoss = hasLossClass || /Contract\s+value:\s*0\.00/i.test(text) || /Loss/i.test(text) || lastSeenPnL < 0;
-      // Definite Win: Profit class or positive lastSeenPnL WITHOUT any loss markers
-      const isDefiniteWin = (hasProfitClass && lastSeenPnL > 0) || (lastSeenPnL > 0 && !isDefiniteLoss);
+      const isDefiniteLoss = hasLossClass || /Contract\s+value:\s*0\.00/i.test(text) || /Loss/i.test(text) || lastSeenPnL < 0 || (lastSeenPnL === 0 && !isDefiniteWin);
 
-      if (text.includes('Closed') || /Contract\s+value:\s*0\.00/i.test(text)) {
+      // Detection of terminal state
+      const isClosed = text.includes('Closed') || /Contract\s+value:\s*0\.00/i.test(text) || text.includes('Total profit/loss');
+
+      if (isClosed) {
         closedResult = { pnl: lastSeenPnL, result: isDefiniteWin ? 'WIN' : 'LOSS' };
       } else if (text.includes('no open positions') && realExecState === 'OPEN') {
         closedResult = { pnl: lastSeenPnL, result: isDefiniteWin ? 'WIN' : 'LOSS' };
