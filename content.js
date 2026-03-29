@@ -194,7 +194,7 @@
     if (!tick || tick.symbol !== resolvedSymbol) return;
     const price = parseFloat(tick.quote), epoch = tick.epoch, now = Date.now(); tickSeq++;
     const prevTick = ticks.length ? ticks[ticks.length - 1] : null;
-    const delta = prevTick ? price - prevTick.price : 0, deltaSteps = delta / 0.1, direction = delta > 0 ? 1 : (delta < 0 ? -1 : 0);
+    const delta = prevTick ? price - prevTick.price : 0, deltaSteps = Math.round(delta / 0.1), direction = delta > 0 ? 1 : (delta < 0 ? -1 : 0);
     const deltaTime = prevTick ? (now - prevTick.receivedAt) : 1000;
     const speed = deltaTime > 0 ? deltaSteps / deltaTime : 0, absSpeed = Math.abs(speed);
     const speedTrend = prevTick ? (absSpeed - prevTick.absSpeed) : 0;
@@ -264,16 +264,16 @@
       const tMinus1 = n >= 2 ? ticks[n - 2] : null;
       if (!tMinus1) return null;
 
-      // "Calm Before the Storm" Timing Check: ~1000ms delay, avoid spikes < 500ms
+      // "Calm Before the Storm" Timing Check: ~1000ms delay, avoid spikes < 400ms
       // Both Setup (T-1) and Trigger (T0) should be in the "Steady" timing zone (avg 1032ms and 991ms)
-      const isCalm = (tMinus1.deltaTime >= 500 && tMinus1.deltaTime <= 1500) &&
-                     (t0.deltaTime >= 500 && t0.deltaTime <= 1500);
+      const isCalm = (tMinus1.deltaTime >= 400 && tMinus1.deltaTime <= 1800) &&
+                     (t0.deltaTime >= 400 && t0.deltaTime <= 1800);
       if (!isCalm) return null;
 
       // BUY DNA (Catching 5+ UP Streaks)
       // SETUP (T-1): Normal Speed + Digit 2, 5, or 9
       // TRIGGER (T0): Direction Flip (DOWN->UP) + Accel 2.0
-      if (t0.direction === 1 && tMinus1.direction === -1 && Math.abs(t0.deltaChange - 2.0) < 0.01) {
+      if (t0.direction === 1 && tMinus1.direction === -1 && t0.deltaChange === 2) {
         if ([2, 5, 9].includes(tMinus1.lastDigit)) {
           return { type: 'BUY', conf: 90, triggerDigit: tMinus1.lastDigit, triggerDesc: 'Flip+Accel(2.0)' };
         }
@@ -282,7 +282,7 @@
       // SELL DNA (Catching 5+ DOWN Streaks)
       // SETUP (T-1): Normal Speed + Digit 9 or 6
       // TRIGGER (T0): Direction Flip (UP->DOWN) + Accel -2.0
-      if (t0.direction === -1 && tMinus1.direction === 1 && Math.abs(t0.deltaChange + 2.0) < 0.01) {
+      if (t0.direction === -1 && tMinus1.direction === 1 && t0.deltaChange === -2) {
         if ([9, 6].includes(tMinus1.lastDigit)) {
           return { type: 'SELL', conf: 90, triggerDigit: tMinus1.lastDigit, triggerDesc: 'Flip+Accel(-2.0)' };
         }
@@ -386,43 +386,44 @@
   function loadCfg() { const stored = safeStorage('get', 'tt-cfg'); return Object.assign({ strategyMode: 'hybrid', epsilon: 0.2, realTradeEnabled: false, realTimeoutMs: 40000, realCooldownMs: 5000, postTradeCooldownTicks: 5, postTradeCooldownMs: 5000, debugSignals: true }, stored || {}); }
   function applyConfigToUI() { const dbg = document.getElementById('tt-cfg-debug'), re = document.getElementById('tt-cfg-real-enabled'), mode = document.getElementById('tt-cfg-strategy-mode'), eps = document.getElementById('tt-cfg-epsilon'); if (dbg) dbg.checked = cfg.debugSignals; if (re) re.checked = !!cfg.realTradeEnabled; if (mode) mode.value = cfg.strategyMode; if (eps) eps.value = cfg.epsilon; updateRealUI(); }
   function startWatchdog() { if (watchdogInterval) clearInterval(watchdogInterval); watchdogInterval = setInterval(() => { const now = Date.now(); if (wsState !== 'connected') return; if (lastTickProcessedAt > 0 && now - lastTickProcessedAt > WATCHDOG_TICK_TIMEOUT) { if (ws) ws.close(); scheduleReconnect(); } }, WATCHDOG_INTERVAL); }
+  let subObserver = null;
   function setupFlyoutObserver() {
     if (flyoutObserver) return;
     flyoutObserver = new MutationObserver((mutations) => {
-      const hasPlatformMutation = mutations.some(m => {
-        let node = m.target;
-        if (node.nodeType === 3) node = node.parentElement;
-        return node && node.id !== 'tt-overlay' && !node.closest?.('#tt-overlay');
-      });
-      if (!hasPlatformMutation) return;
-
       const flyout = document.querySelector(SEL_FLYOUT);
-      if (!flyout) {
+      if (flyout) {
+        if (!subObserver) {
+          subObserver = new MutationObserver(() => processFlyout(flyout));
+          subObserver.observe(flyout, { childList: true, subtree: true, characterData: true });
+          processFlyout(flyout);
+        }
+      } else {
+        if (subObserver) { subObserver.disconnect(); subObserver = null; }
         if (realOpenCount !== 0) {
           realOpenCount = 0;
-          updateRealExecStateFromDOM(0, { pnl: lastSeenPnL, result: lastSeenPnL >= 0 ? 'WIN' : 'LOSS' });
+          updateRealExecStateFromDOM(0, { pnl: lastSeenPnL, result: lastSeenPnL > 0 ? 'WIN' : 'LOSS' });
         }
-        return;
       }
+    });
+    flyoutObserver.observe(document.body, { childList: true });
+  }
 
-      // Use innerText as it respects line breaks and visibility, often better for matching UI messages
+  function processFlyout(flyout) {
       const text = flyout.innerText;
       const hasProfitClass = !!flyout.querySelector('.dc-contract-card--profit, .dc-contract-card__profit-loss--is-profit');
       const hasLossClass = !!flyout.querySelector('.dc-contract-card--loss, .dc-contract-card__profit-loss--is-loss');
 
       // Track real-time PnL from the flyout while trade is open
-      // 1. Prioritize explicit "Total profit/loss" or "Profit/Loss"
-      // 2. Look for large banner values (often signed like -10.00 USD)
-      const pnlRegex = /(?:Total\s+profit\/loss|Profit\/Loss)[:\s]*([+-]?\d+\.?\d*)/i;
-      const pnlMatch = text.match(pnlRegex);
-      if (pnlMatch) {
-        lastSeenPnL = parseFloat(pnlMatch[1]);
+      // Use specific selectors if possible, otherwise regex on innerText
+      const pnlEl = flyout.querySelector('.dc-contract-card__profit-loss-label, .dc-status-colored-text');
+      if (pnlEl) {
+        const val = parseFloat(pnlEl.innerText.replace(/[^-0-9.]/g, ''));
+        if (!isNaN(val)) lastSeenPnL = val;
       } else {
-        const usdMatches = text.match(/([+-]?\d+\.?\d*)\s+USD/g);
-        if (usdMatches) {
-          // The first match is usually the most prominent (e.g. banner payout or pnl)
-          const val = parseFloat(usdMatches[0].match(/[+-]?\d+\.?\d*/)[0]);
-          if (!isNaN(val)) lastSeenPnL = val;
+        const pnlRegex = /(?:Total\s+profit\/loss|Profit\/Loss)[:\s]*([+-]?\d+\.?\d*)/i;
+        const pnlMatch = text.match(pnlRegex);
+        if (pnlMatch) {
+          lastSeenPnL = parseFloat(pnlMatch[1]);
         }
       }
 
@@ -445,18 +446,18 @@
         realOpenCount = count;
         updateRealExecStateFromDOM(count, closedResult);
       }
-    });
-    flyoutObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
   }
   function updateRealExecStateFromDOM(count, closedResult) {
     if (closedResult && (realExecState === 'OPEN' || realExecState === 'OPEN_PENDING' || realExecState === 'RECOVERY')) {
       finalizeRealTrade(closedResult);
       realExecState = 'IDLE';
       realLockReason = '';
+      lastSeenPnL = 0;
     } else if (count === 0 && (realExecState === 'OPEN' || realExecState === 'RECOVERY')) {
-      finalizeRealTrade({ pnl: lastSeenPnL, result: lastSeenPnL >= 0 ? 'WIN' : 'LOSS' });
+      finalizeRealTrade({ pnl: lastSeenPnL, result: lastSeenPnL > 0 ? 'WIN' : 'LOSS' });
       realExecState = 'IDLE';
       realLockReason = '';
+      lastSeenPnL = 0;
     }
     if (count > 0 && ['IDLE', 'OPEN_PENDING'].includes(realExecState)) {
       realExecState = 'OPEN';
@@ -502,9 +503,29 @@
       realExecTimer = setTimeout(() => { if (['OPEN_PENDING', 'OPEN'].includes(realExecState)) { realExecState = 'RECOVERY'; realLockReason = 'TIMEOUT'; updateRealUI(); } }, cfg.realTimeoutMs);
     } catch (e) { realLockReason = 'ERR:' + e.message; updateRealUI(); setTimeout(() => { if (realExecState === 'OPEN_PENDING') { realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); } }, 3000); }
   }
-  async function setRealTradeSide(label, activeClass) { for (let i = 0; i < 3; i++) { await new Promise(r => setTimeout(r, 150)); const btn = document.querySelector(SEL_PURCHASE_BTN); if (btn && btn.classList.contains(activeClass)) return true; const target = Array.from(document.querySelectorAll(SEL_SIDE_BTNS)).find(b => b.innerText.includes(label)); if (target) { simulateExternalClick(target); await new Promise(r => setTimeout(r, 350)); } } return false; }
+  async function setRealTradeSide(label, activeClass) {
+    for (let i = 0; i < 3; i++) {
+      const btn = document.querySelector(SEL_PURCHASE_BTN);
+      if (btn && btn.classList.contains(activeClass)) return true;
+      const target = Array.from(document.querySelectorAll(SEL_SIDE_BTNS)).find(b => b.innerText.includes(label));
+      if (target) {
+        simulateExternalClick(target);
+        await new Promise(r => setTimeout(r, 150)); // Faster response
+      } else {
+        await new Promise(r => setTimeout(r, 50));
+      }
+    }
+    return false;
+  }
   function simulateExternalClick(el) { const opts = { bubbles: true, cancelable: true, view: window }; el.dispatchEvent(new MouseEvent('mouseenter', opts)); el.dispatchEvent(new MouseEvent('mousedown', opts)); el.focus(); el.dispatchEvent(new MouseEvent('mouseup', opts)); el.dispatchEvent(new MouseEvent('click', opts)); el.dispatchEvent(new MouseEvent('mouseleave', opts)); }
-  async function waitRealBuyReady() { for (let i = 0; i < 5; i++) { const btn = document.querySelector(SEL_PURCHASE_BTN); if (btn && btn.getAttribute('data-loading') !== 'true' && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') return true; await new Promise(r => setTimeout(r, 300)); } return false; }
+  async function waitRealBuyReady() {
+    for (let i = 0; i < 5; i++) {
+      const btn = document.querySelector(SEL_PURCHASE_BTN);
+      if (btn && btn.getAttribute('data-loading') !== 'true' && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') return true;
+      await new Promise(r => setTimeout(r, 100)); // Shorter wait increments
+    }
+    return false;
+  }
   function init() { if (document.getElementById('tt-overlay')) return; cfg = loadCfg(); buildOverlay(); connect(); startWatchdog(); setupFlyoutObserver(); window._tt_cfg = cfg; window._tt_detect = detectSignal; }
   if (document.body) init(); else document.addEventListener('DOMContentLoaded', init);
 })();
