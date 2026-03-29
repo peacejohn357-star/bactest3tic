@@ -407,32 +407,38 @@
 
       // Use innerText as it respects line breaks and visibility, often better for matching UI messages
       const text = flyout.innerText;
+      const hasProfitClass = !!flyout.querySelector('.dc-contract-card--profit, .dc-contract-card__profit-loss--is-profit');
+      const hasLossClass = !!flyout.querySelector('.dc-contract-card--loss, .dc-contract-card__profit-loss--is-loss');
+
       // Track real-time PnL from the flyout while trade is open
-      const livePnlMatch = text.match(/Total\s+profit\/loss\s+([+-]?\d+\.?\d*)/i) || text.match(/Profit\/Loss\s+([+-]?\d+\.?\d*)/i);
-      if (livePnlMatch) lastSeenPnL = parseFloat(livePnlMatch[1]);
+      // 1. Prioritize explicit "Total profit/loss" or "Profit/Loss"
+      // 2. Look for large banner values (often signed like -10.00 USD)
+      const pnlRegex = /(?:Total\s+profit\/loss|Profit\/Loss)[:\s]*([+-]?\d+\.?\d*)/i;
+      const pnlMatch = text.match(pnlRegex);
+      if (pnlMatch) {
+        lastSeenPnL = parseFloat(pnlMatch[1]);
+      } else {
+        const usdMatches = text.match(/([+-]?\d+\.?\d*)\s+USD/g);
+        if (usdMatches) {
+          // The first match is usually the most prominent (e.g. banner payout or pnl)
+          const val = parseFloat(usdMatches[0].match(/[+-]?\d+\.?\d*/)[0]);
+          if (!isNaN(val)) lastSeenPnL = val;
+        }
+      }
 
       let count = text.includes('no open positions') ? 0 : (text.match(/(\d+)\s+open\s+position/i) ? parseInt(text.match(/(\d+)\s+open\s+position/i)[1], 10) : realOpenCount);
       let closedResult = null;
 
-      // EXPLICIT LOSS DETECTION
-      // 1. Contract value 0.00 is a total loss.
-      // 2. Explicit "Loss" text in the flyout (case insensitive).
-      // 3. Negative value seen in lastSeenPnL during settlement.
-      const isExplicitLoss = text.includes('Contract value: 0.00') || /Loss/i.test(text) || lastSeenPnL < 0;
+      // EXPLICIT WIN/LOSS DETECTION
+      // Definite Loss: Contract value 0.00, Loss class, "Loss" text, or NEGATIVE lastSeenPnL
+      const isDefiniteLoss = hasLossClass || /Contract\s+value:\s*0\.00/i.test(text) || /Loss/i.test(text) || lastSeenPnL < 0;
+      // Definite Win: Profit class or positive lastSeenPnL WITHOUT any loss markers
+      const isDefiniteWin = (hasProfitClass && lastSeenPnL > 0) || (lastSeenPnL > 0 && !isDefiniteLoss);
 
-      // EXPLICIT WIN DETECTION
-      // 1. Explicit "Profit" or "Won" text.
-      // 2. Positive lastSeenPnL without loss indicators.
-      const isExplicitWin = (/Profit/i.test(text) || /Won/i.test(text)) && lastSeenPnL > 0;
-
-      if (text.includes('Closed')) {
-        const pnlMatch = text.match(/([+-]?\d+\.?\d*)\s+USD/i);
-        const val = pnlMatch ? parseFloat(pnlMatch[1]) : lastSeenPnL;
-        closedResult = { pnl: val, result: (isExplicitWin || (val > 0 && !isExplicitLoss)) ? 'WIN' : 'LOSS' };
-      } else if (isExplicitLoss && text.includes('Contract value: 0.00')) {
-        closedResult = { pnl: lastSeenPnL, result: 'LOSS' };
+      if (text.includes('Closed') || /Contract\s+value:\s*0\.00/i.test(text)) {
+        closedResult = { pnl: lastSeenPnL, result: isDefiniteWin ? 'WIN' : 'LOSS' };
       } else if (text.includes('no open positions') && realExecState === 'OPEN') {
-        closedResult = { pnl: lastSeenPnL, result: (lastSeenPnL > 0 && !isExplicitLoss) ? 'WIN' : 'LOSS' };
+        closedResult = { pnl: lastSeenPnL, result: isDefiniteWin ? 'WIN' : 'LOSS' };
       }
 
       if (count !== realOpenCount || closedResult) {
