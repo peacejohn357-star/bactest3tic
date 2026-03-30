@@ -331,7 +331,9 @@
           strategy: mode,
           isReal: cfg.realTradeEnabled,
           triggerDigit: res.triggerDigit,
-          triggerDesc: res.triggerDesc
+          triggerDesc: res.triggerDesc,
+          startTickIndex: null,
+          startTime: null
         };
         signals.push(sig); if (signals.length > 50) signals.shift(); recordSessionTrade(sig); updateSignalsUI();
         if (cfg.realTradeEnabled) { realExecState = 'OPEN_PENDING'; realLockReason = 'EXECUTING'; updateRealUI(); executeRealTrade(res.type); }
@@ -383,15 +385,15 @@
   function recordSessionTrade(sig) { sessionTradesAll.push(sig); if (sessionTradesAll.length > SESSION_HISTORY_CAP) sessionTradesAll.shift(); }
   function exportCSV() {
     if (!sessionTradesAll.length) return;
-    const rows = [['Type', 'Strategy', 'Confidence', 'Price', 'Time', 'Result', 'Trigger Digit', 'Trigger Desc']].concat(sessionTradesAll.map(s => [s.type, s.strategy, s.confidence, s.price.toFixed(2), s.time, s.result, s.triggerDigit ?? '', s.triggerDesc ?? '']));
+    const rows = [['Type', 'Strategy', 'Confidence', 'Price', 'Time', 'Result', 'Trigger Digit', 'Trigger Desc', 'Start Tick', 'Confirm Time']].concat(sessionTradesAll.map(s => [s.type, s.strategy, s.confidence, s.price.toFixed(2), s.time, s.result, s.triggerDigit ?? '', s.triggerDesc ?? '', s.startTickIndex ?? '', s.startTime ? new Date(s.startTime).toISOString() : '']));
     const csv = rows.map(r => r.join(',')).join('\n'); const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = '3tick-signals.csv'; a.click();
   }
   function exportRealCSV() {
     if (!realTrades.length) return;
-    const rows = [['Time', 'Signal', 'Side', 'Result', 'PnL', 'Trigger Digit', 'Trigger Desc']].concat(realTrades.map(t => {
+    const rows = [['Time', 'Signal', 'Side', 'Result', 'PnL', 'Trigger Digit', 'Trigger Desc', 'Start Tick', 'Confirm Time']].concat(realTrades.map(t => {
       const s = t.signalRef || {};
-      return [new Date(t.time).toISOString(), t.signal, t.side, t.result, t.pnl || '', s.triggerDigit ?? '', s.triggerDesc ?? ''];
+      return [new Date(t.time).toISOString(), t.signal, t.side, t.result, t.pnl || '', s.triggerDigit ?? '', s.triggerDesc ?? '', t.startTickIndex ?? '', t.startTime ? new Date(t.startTime).toISOString() : ''];
     }));
     const csv = rows.map(r => r.join(',')).join('\n'); const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = '3tick-real.csv'; a.click();
@@ -427,6 +429,23 @@
 
   function processFlyout(flyout) {
       const text = flyout.innerText;
+
+      // Error Correction: Check if this is a PURCHASE confirmation
+      if (text.includes("Contract bought") || text.includes("ID:")) {
+        const sig = signals.find(s => s.result === 'PENDING' && s.isReal && !s.startTickIndex);
+        if (sig) {
+          // Corrected: The contract starts on the NEXT tick, not the current one
+          sig.startTickIndex = tickSeq + 1;
+          sig.startTime = Date.now();
+          console.log(`[System] Contract Confirmed. Start Tick anchored at: ${sig.startTickIndex}`);
+
+          const real = realTrades.find(t => t.result === 'PENDING' && !t.startTickIndex);
+          if (real) {
+            real.startTickIndex = sig.startTickIndex;
+            real.startTime = sig.startTime;
+          }
+        }
+      }
       const hasProfitClass = !!flyout.querySelector('.dc-contract-card--profit, .dc-contract-card__profit-loss--is-profit, .dc-contract-card-item__body--profit');
       const hasLossClass = !!flyout.querySelector('.dc-contract-card--loss, .dc-contract-card__profit-loss--is-loss, .dc-contract-card-item__body--loss');
 
@@ -527,7 +546,7 @@
       const btn = document.querySelector(SEL_PURCHASE_BTN); if (!btn || !btn.classList.contains(activeClass)) throw new Error('btn_mismatch');
       simulateExternalClick(btn); lastRealTradeAt = Date.now();
       const signalToMark = signals.find(s => s.result === 'PENDING' && s.isReal);
-      realTrades.push({ time: Date.now(), signal: side, side: buyLabel, result: 'PENDING', signalRef: signalToMark });
+      realTrades.push({ time: Date.now(), signal: side, side: buyLabel, result: 'PENDING', signalRef: signalToMark, startTickIndex: null, startTime: null });
       realExecTimer = setTimeout(() => { if (['OPEN_PENDING', 'OPEN'].includes(realExecState)) { realExecState = 'RECOVERY'; realLockReason = 'TIMEOUT'; updateRealUI(); } }, cfg.realTimeoutMs);
     } catch (e) { realLockReason = 'ERR:' + e.message; updateRealUI(); setTimeout(() => { if (realExecState === 'OPEN_PENDING') { realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); } }, 3000); }
   }
