@@ -225,10 +225,25 @@
 
     try { detectSignal(); lastSignalEvalAt = Date.now(); } catch (e) { evalErrorCount++; }
 
-    // Update pending signals for simulation/logging
+    // Update pending signals for strict Deriv 3-Tick simulation/logging
     signals.forEach(sig => {
-      if (sig.result === 'PENDING') {
+      if (sig.result === 'PENDING' && !sig.isReal) { // Only auto-resolve paper trades
         sig.ticksAfter.push(price);
+
+        // Wait for exactly 4 ticks after the signal (T1, T2, T3, T4)
+        if (sig.ticksAfter.length === 4) {
+          const entryPrice = sig.ticksAfter[0]; // T1: The official start tick
+          const exitPrice = sig.ticksAfter[3];  // T4: The official exit tick
+
+          if (sig.type === 'BUY') {
+            sig.result = (exitPrice > entryPrice) ? 'WIN' : (exitPrice < entryPrice ? 'LOSS' : 'DRAW');
+          } else if (sig.type === 'SELL') {
+            sig.result = (exitPrice < entryPrice) ? 'WIN' : (exitPrice > entryPrice ? 'LOSS' : 'DRAW');
+          }
+          updateSignalsUI();
+        }
+      } else if (sig.result === 'PENDING' && sig.isReal) {
+        sig.ticksAfter.push(price); // Real trades are resolved by the Flyout Observer
       }
     });
   }
