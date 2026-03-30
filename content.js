@@ -18,21 +18,14 @@
   const WATCHDOG_TICK_TIMEOUT = 25000;
 
   // ── DOM Selectors ─────────────────────────────────────────────────────────
-  const SEL_SIDE_BTNS    = '.trade-params__option > button.item';
-  const SEL_PURCHASE_BTN = 'button.purchase-button.purchase-button--single';
-  const CLASS_RISE_ACTIVE = 'quill__color--primary-purchase';
-  const CLASS_FALL_ACTIVE = 'quill__color--primary-sell';
-  const SEL_FLYOUT       = '.dc-flyout';
+  // Real trading selectors removed
 
   let cfg = {
     tickSize: 0.1,
-    strategyMode: 'hybrid',
+    strategyMode: 'all', // Defaulting to all for backtest
     epsilon: 0.2,
-    realTradeEnabled: false,
-    realTimeoutMs: 40000,
-    realCooldownMs: 5000,
-    postTradeCooldownTicks: 5,
-    postTradeCooldownMs: 5000,
+    postTradeCooldownTicks: 0, // Reduced for backtest
+    postTradeCooldownMs: 0,
     debugSignals: true,
   };
 
@@ -43,8 +36,8 @@
   let signals = [], sessionTradesAll = [];
   let tickSeq = 0, lastSignalTickIndex = -999, upStreak = 0, downStreak = 0;
   let lastTickProcessedAt = 0, lastSignalEvalAt = 0, watchdogInterval = null, evalErrorCount = 0;
-  let realExecState = 'IDLE', realTrades = [], realOpenCount = 0, realWins = 0, realLosses = 0, realPnl = 0, realLockReason = '', lastRealTradeAt = 0, lastTradeClosedAt = 0, lastTradeClosedTick = -999, realExecTimer = null, lastSeenPnL = 0;
-  let flyoutObserver = null, ws = null, wsState = 'disconnected', reconnectTimer = null, resolvedSymbol = null, manualClose = false, reconnectDelay = RECONNECT_BASE, failCount = 0, usingFallback = false;
+  let paperWins = 0, paperLosses = 0;
+  let ws = null, wsState = 'disconnected', reconnectTimer = null, resolvedSymbol = null, manualClose = false, reconnectDelay = RECONNECT_BASE, failCount = 0, usingFallback = false;
 
   // UI Cache to prevent redundant DOM updates
   let lastUI = { state: '', pnl: null, wins: -1, losses: -1, price: '', stats: '', dist: '', dirStreak: '' };
@@ -56,7 +49,7 @@
     el.id = 'tt-overlay';
     el.innerHTML = `
       <div id="tt-header">
-        <span class="tt-title">3Tick Timing V2</span>
+        <span class="tt-title">3Tick Backtest V1</span>
         <div class="tt-header-btns"><button id="tt-min-btn" title="Minimise">_</button><button id="tt-close-btn" title="Close">X</button></div>
       </div>
       <div id="tt-body">
@@ -65,25 +58,16 @@
         <div class="tt-row"><span class="tt-label">Dir / Streak</span><span class="tt-val" id="tt-dir-streak">- / 0</span></div>
         <div class="tt-row"><span class="tt-label">S_Low / S_High</span><span class="tt-val" id="tt-speed-stats">0.00 / 0.00</span></div>
         <div class="tt-row"><span class="tt-label">Mean / Std</span><span class="tt-val" id="tt-speed-dist">0.00 / 0.00</span></div>
-        <div class="tt-row"><span class="tt-label">Session W/L</span><span class="tt-val"><span id="tt-wins">0</span> / <span id="tt-losses">0</span></span></div>
+        <div class="tt-row"><span class="tt-label">Paper W/L</span><span class="tt-val"><span id="tt-wins">0</span> / <span id="tt-losses">0</span></span></div>
         <div id="tt-signals-list"></div>
-        <div class="tt-config-section-label">Real Execution</div>
-        <div id="tt-real-panel">
-          <div class="tt-row"><span class="tt-label">Exec State</span><span class="tt-val" id="tt-real-state">IDLE</span></div>
-          <div class="tt-row"><span class="tt-label">Real PnL</span><span class="tt-val" id="tt-real-pnl">0.00</span></div>
-          <button id="tt-real-export">Download Real CSV</button>
-          <button id="tt-real-reset" style="background:#3d1a1a;color:#e04040;margin-top:2px;">Reset Engine</button>
-        </div>
         <button id="tt-config-toggle">Settings</button>
         <div id="tt-config">
-          <div class="tt-config-row"><label>Mode</label><select id="tt-cfg-strategy-mode"><option value="trendIgnition">Trend Ignition</option><option value="reversalIgnition">Reversal Ignition</option><option value="ignitionSuite">Full Ignition Suite</option><option value="ignition">Ignition</option><option value="structural3">Structural 3</option><option value="structural2">Structural 2</option><option value="structural">Structural</option><option value="hybrid">Hybrid</option><option value="momentum">Momentum</option><option value="reversal">Reversal</option></select></div>
+          <div class="tt-config-row"><label>Mode</label><select id="tt-cfg-strategy-mode"><option value="all">All Strategies</option><option value="trendIgnition">Trend Ignition</option><option value="reversalIgnition">Reversal Ignition</option><option value="ignitionSuite">Full Ignition Suite</option><option value="ignition">Ignition</option><option value="structural3">Structural 3</option><option value="structural2">Structural 2</option><option value="structural">Structural</option><option value="hybrid">Hybrid</option><option value="momentum">Momentum</option><option value="reversal">Reversal</option></select></div>
           <div class="tt-config-row"><label>Intensity (Min)</label><input type="number" id="tt-cfg-intensity" min="0.5" max="3" step="0.1" value="1.2"></div>
           <div class="tt-config-row"><label>Epsilon</label><input type="number" id="tt-cfg-epsilon" min="0" max="1" step="0.01" value="0.2"></div>
           <div class="tt-config-row"><label>Debug Signals</label><input type="checkbox" id="tt-cfg-debug"></div>
-          <div class="tt-config-section-label">Real Trade Master</div>
-          <div class="tt-config-row"><label style="color:#f0a060;font-weight:700;">Enable Real Execution</label><label class="tt-switch"><input type="checkbox" id="tt-cfg-real-enabled"><span class="tt-slider"></span></label></div>
         </div>
-        <button id="tt-export">Download Signals CSV</button>
+        <button id="tt-export">Download Backtest CSV</button>
       </div>
       <div id="tt-alert"></div>
     `;
@@ -121,9 +105,6 @@
     document.getElementById('tt-cfg-intensity').addEventListener('change', function () { cfg.minIntensity = parseFloat(this.value) || 1.2; saveCfg(); });
     document.getElementById('tt-cfg-epsilon').addEventListener('change', function () { cfg.epsilon = parseFloat(this.value) || 0.2; saveCfg(); });
     document.getElementById('tt-cfg-debug').addEventListener('change', function () { cfg.debugSignals = this.checked; saveCfg(); });
-    document.getElementById('tt-cfg-real-enabled').addEventListener('change', function () { cfg.realTradeEnabled = this.checked; saveCfg(); });
-    document.getElementById('tt-real-export').addEventListener('click', exportRealCSV);
-    document.getElementById('tt-real-reset').addEventListener('click', () => { if (confirm('Reset real-trade engine to IDLE and clear lock?')) { realExecState = 'IDLE'; realLockReason = ''; realOpenCount = 0; clearTimeout(realExecTimer); updateRealUI(); } });
     document.getElementById('tt-export').addEventListener('click', exportCSV);
     applyConfigToUI();
   }
@@ -233,23 +214,26 @@
 
     // Update pending signals for strict Deriv 3-Tick simulation/logging
     signals.forEach(sig => {
-      if (sig.result === 'PENDING' && !sig.isReal) { // Only auto-resolve paper trades
+      if (sig.result === 'PENDING') {
         sig.ticksAfter.push(price);
 
-        // Wait for exactly 4 ticks after the signal (T1, T2, T3, T4)
+        // T1 is the first tick after purchase confirmation (next-tick execution)
+        // T2, T3, T4 follow. The contract settles on T4 (3 ticks passed from T1).
         if (sig.ticksAfter.length === 4) {
-          const entryPrice = sig.ticksAfter[0]; // T1: The official start tick
-          const exitPrice = sig.ticksAfter[3];  // T4: The official exit tick
+          const entryPrice = sig.ticksAfter[0]; // T1
+          const exitPrice = sig.ticksAfter[3];  // T4
+          sig.entryPrice = entryPrice;
+          sig.exitPrice = exitPrice;
 
           if (sig.type === 'BUY') {
             sig.result = (exitPrice > entryPrice) ? 'WIN' : (exitPrice < entryPrice ? 'LOSS' : 'DRAW');
           } else if (sig.type === 'SELL') {
             sig.result = (exitPrice < entryPrice) ? 'WIN' : (exitPrice > entryPrice ? 'LOSS' : 'DRAW');
           }
+          if (sig.result === 'WIN') paperWins++; else if (sig.result === 'LOSS') paperLosses++;
           updateSignalsUI();
+          updateWinsLossesUI();
         }
-      } else if (sig.result === 'PENDING' && sig.isReal) {
-        sig.ticksAfter.push(price); // Real trades are resolved by the Flyout Observer
       }
     });
   }
@@ -374,27 +358,36 @@
       return null;
     };
 
-    let res = null;
-    // Evaluation Priority
-    if (mode === 'trendIgnition') res = checkTrendIgnition();
-    else if (mode === 'reversalIgnition') res = checkReversalIgnition();
-    else if (mode === 'ignitionSuite') {
-      if (Math.max(t0.upStreak, t0.downStreak) < 4) res = checkReversalIgnition() || checkTrendIgnition();
-    }
-    else if (mode === 'ignition') res = checkIgnition() || checkStructural3();
-    else if (mode === 'structural3') res = checkStructural3() || checkStructural2();
-    else if (mode === 'structural2') res = checkStructural2();
-    else if (mode === 'structural') res = checkStructural();
-    else if (mode === 'hybrid') res = checkIgnition() || checkStructural3() || checkHybrid() || checkStructural2();
-    else if (mode === 'momentum') res = checkMomentum() || checkHybrid() || checkStructural2();
-    else if (mode === 'reversal') res = checkReversal();
+    const strategies = {
+      trendIgnition: checkTrendIgnition,
+      reversalIgnition: checkReversalIgnition,
+      ignitionSuite: () => {
+        if (Math.max(t0.upStreak, t0.downStreak) < 4) return checkReversalIgnition() || checkTrendIgnition();
+        return null;
+      },
+      ignition: checkIgnition,
+      structural3: checkStructural3,
+      structural2: checkStructural2,
+      structural: checkStructural,
+      hybrid: checkHybrid,
+      momentum: checkMomentum,
+      reversal: checkReversal
+    };
 
-    if (res) {
-      if (Math.abs(t0.deltaChange) < eps && !['ignition', 'structural3', 'structural2'].includes(mode)) res = null;
+    Object.keys(strategies).forEach(stratName => {
+      // If mode is 'all', we only run the base strategies to avoid redundancy
+      if (mode === 'all') {
+        if (['ignitionSuite'].includes(stratName)) return;
+      } else if (mode !== stratName) {
+        return;
+      }
+
+      const res = strategies[stratName]();
       if (res) {
-        const currentTickIndex = tickSeq;
-        if (currentTickIndex - lastSignalTickIndex < cfg.postTradeCooldownTicks || Date.now() - lastTradeClosedAt < cfg.postTradeCooldownMs || realExecState !== 'IDLE') return null;
-        lastSignalTickIndex = currentTickIndex;
+        // Validation check similar to original logic
+        const needsEpsCheck = !['ignition', 'structural3', 'structural2'].includes(stratName);
+        if (needsEpsCheck && Math.abs(t0.deltaChange) < eps) return;
+
         let conf = res.conf;
         if (!res.triggerDesc && ((res.type === 'BUY' && !buyDigitBias) || (res.type === 'SELL' && !sellDigitBias))) conf -= 10;
 
@@ -405,31 +398,42 @@
           result: 'PENDING',
           ticksAfter: [],
           confidence: Math.min(100, conf),
-          strategy: mode,
-          isReal: cfg.realTradeEnabled,
+          strategy: stratName,
           triggerDigit: res.triggerDigit,
           triggerDesc: res.triggerDesc,
-          startTickIndex: null,
-          startTime: null
+          startTickIndex: tickSeq + 1, // Contract starts on NEXT tick
+          startTime: Date.now(),
+          // Backtest metadata
+          speed: t0.speed,
+          absSpeed: t0.absSpeed,
+          speedTrend: t0.speedTrend,
+          accel: t0.accel,
+          intensity: t0.intensity,
+          upStreak: t0.upStreak,
+          downStreak: t0.downStreak,
+          deltaChange: t0.deltaChange,
+          lastDigit: t0.lastDigit
         };
-        signals.push(sig); if (signals.length > 50) signals.shift(); recordSessionTrade(sig); updateSignalsUI();
-        if (cfg.realTradeEnabled) { realExecState = 'OPEN_PENDING'; realLockReason = 'EXECUTING'; updateRealUI(); executeRealTrade(res.type); }
+        signals.push(sig);
+        if (signals.length > 50) signals.shift();
+        recordSessionTrade(sig);
       }
-    }
+    });
+    updateSignalsUI();
     return null;
   }
 
   // ── Infrastructure ────────────────────────────────────────────────────────
   function updateWinsLossesUI() {
-    if (lastUI.wins !== realWins) {
+    if (lastUI.wins !== paperWins) {
       const we = document.getElementById('tt-wins');
-      if (we) we.textContent = realWins;
-      lastUI.wins = realWins;
+      if (we) we.textContent = paperWins;
+      lastUI.wins = paperWins;
     }
-    if (lastUI.losses !== realLosses) {
+    if (lastUI.losses !== paperLosses) {
       const le = document.getElementById('tt-losses');
-      if (le) le.textContent = realLosses;
-      lastUI.losses = realLosses;
+      if (le) le.textContent = paperLosses;
+      lastUI.losses = paperLosses;
     }
   }
   function updateSignalsUI() {
@@ -437,219 +441,55 @@
     el.innerHTML = ''; signals.slice(-10).reverse().forEach(sig => {
       const div = document.createElement('div'); div.className = `tt-signal tt-signal-${sig.type.toLowerCase()}`;
       const badge = sig.result === 'WIN' ? '<span class="tt-badge tt-badge-win">WIN</span>' : sig.result === 'LOSS' ? '<span class="tt-badge tt-badge-loss">LOSS</span>' : '<span class="tt-badge tt-badge-pending">...</span>';
-      div.innerHTML = `<span class="tt-signal-type">${sig.type}</span><span class="tt-signal-price">${(sig.entryPriceReal || sig.price).toFixed(2)}</span><span class="tt-signal-time">${new Date(sig.time*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})} [${sig.confidence}%]</span>${badge}`;
+      div.innerHTML = `<span class="tt-signal-type">${sig.type}</span><span class="tt-signal-price">${(sig.price).toFixed(2)}</span><span class="tt-signal-time">${new Date(sig.time*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})} [${sig.confidence}%]</span>${badge}`;
       el.appendChild(div);
     });
-  }
-  function updateRealUI() {
-    const stateStr = realExecState + (realLockReason ? ` (${realLockReason})` : '');
-    if (lastUI.state !== stateStr) {
-      const stEl = document.getElementById('tt-real-state');
-      if (stEl) {
-        stEl.textContent = stateStr;
-        stEl.style.color = { IDLE: '#3ecf60', RECOVERY: '#e04040', OPEN: '#f0c040', OPEN_PENDING: '#7ec8e3' }[realExecState] || '#fff';
-      }
-      lastUI.state = stateStr;
-    }
-    const pnlEl = document.getElementById('tt-real-pnl');
-    if (pnlEl) {
-      pnlEl.textContent = realPnl.toFixed(2);
-      pnlEl.style.color = realPnl >= 0 ? '#3ecf60' : '#e04040';
-    }
-    updateWinsLossesUI();
   }
   function showAlert(msg) { const el = document.getElementById('tt-alert'); if (el) { el.textContent = msg; el.classList.add('tt-visible'); setTimeout(() => el.classList.remove('tt-visible'), 5000); } }
   function recordSessionTrade(sig) { sessionTradesAll.push(sig); if (sessionTradesAll.length > SESSION_HISTORY_CAP) sessionTradesAll.shift(); }
   function exportCSV() {
     if (!sessionTradesAll.length) return;
-    const rows = [['Type', 'Strategy', 'Confidence', 'Price', 'Time', 'Result', 'Trigger Digit', 'Trigger Desc', 'Start Tick', 'Confirm Time']].concat(sessionTradesAll.map(s => [s.type, s.strategy, s.confidence, s.price.toFixed(2), s.time, s.result, s.triggerDigit ?? '', s.triggerDesc ?? '', s.startTickIndex ?? '', s.startTime ? new Date(s.startTime).toISOString() : '']));
-    const csv = rows.map(r => r.join(',')).join('\n'); const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = '3tick-signals.csv'; a.click();
-  }
-  function exportRealCSV() {
-    if (!realTrades.length) return;
-    const rows = [['Time', 'Signal', 'Side', 'Result', 'PnL', 'Trigger Digit', 'Trigger Desc', 'Start Tick', 'Confirm Time']].concat(realTrades.map(t => {
-      const s = t.signalRef || {};
-      return [new Date(t.time).toISOString(), t.signal, t.side, t.result, t.pnl || '', s.triggerDigit ?? '', s.triggerDesc ?? '', t.startTickIndex ?? '', t.startTime ? new Date(t.startTime).toISOString() : ''];
-    }));
-    const csv = rows.map(r => r.join(',')).join('\n'); const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = '3tick-real.csv'; a.click();
+    const header = [
+      'Time', 'Type', 'Strategy', 'Confidence', 'Signal Price', 'Entry Price', 'Exit Price',
+      'Result', 'Trigger Digit', 'Trigger Desc', 'Start Tick Seq',
+      'Speed', 'AbsSpeed', 'SpeedTrend', 'Accel', 'Intensity', 'UpStreak', 'DownStreak', 'DeltaChange', 'LastDigit'
+    ];
+    const rows = [header].concat(sessionTradesAll.map(s => [
+      new Date(s.time * 1000).toLocaleTimeString(),
+      s.type,
+      s.strategy,
+      s.confidence,
+      s.price.toFixed(2),
+      s.entryPrice ? s.entryPrice.toFixed(2) : '',
+      s.exitPrice ? s.exitPrice.toFixed(2) : '',
+      s.result,
+      s.triggerDigit ?? '',
+      s.triggerDesc ?? '',
+      s.startTickIndex ?? '',
+      s.speed.toFixed(4),
+      s.absSpeed.toFixed(4),
+      s.speedTrend.toFixed(4),
+      s.accel.toFixed(4),
+      s.intensity.toFixed(4),
+      s.upStreak,
+      s.downStreak,
+      s.deltaChange,
+      s.lastDigit
+    ]));
+    const csv = rows.map(r => r.join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `3tick-backtest-${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.csv`;
+    a.click();
   }
   function safeStorage(op, key, val) { try { if (op === 'get') return JSON.parse(localStorage.getItem(key)); if (op === 'set') localStorage.setItem(key, JSON.stringify(val)); } catch (_) { } return null; }
   function saveCfg() { safeStorage('set', 'tt-cfg', cfg); }
-  function loadCfg() { const stored = safeStorage('get', 'tt-cfg'); return Object.assign({ strategyMode: 'hybrid', epsilon: 0.2, minIntensity: 1.2, realTradeEnabled: false, realTimeoutMs: 40000, realCooldownMs: 5000, postTradeCooldownTicks: 5, postTradeCooldownMs: 5000, debugSignals: true }, stored || {}); }
-  function applyConfigToUI() { const dbg = document.getElementById('tt-cfg-debug'), re = document.getElementById('tt-cfg-real-enabled'), mode = document.getElementById('tt-cfg-strategy-mode'), eps = document.getElementById('tt-cfg-epsilon'), intensity = document.getElementById('tt-cfg-intensity'); if (dbg) dbg.checked = cfg.debugSignals; if (re) re.checked = !!cfg.realTradeEnabled; if (mode) mode.value = cfg.strategyMode; if (eps) eps.value = cfg.epsilon; if (intensity) intensity.value = cfg.minIntensity || 1.2; updateRealUI(); }
+  function loadCfg() { const stored = safeStorage('get', 'tt-cfg'); return Object.assign({ strategyMode: 'all', epsilon: 0.2, minIntensity: 1.2, postTradeCooldownTicks: 0, postTradeCooldownMs: 0, debugSignals: true }, stored || {}); }
+  function applyConfigToUI() { const dbg = document.getElementById('tt-cfg-debug'), mode = document.getElementById('tt-cfg-strategy-mode'), eps = document.getElementById('tt-cfg-epsilon'), intensity = document.getElementById('tt-cfg-intensity'); if (dbg) dbg.checked = cfg.debugSignals; if (mode) mode.value = cfg.strategyMode; if (eps) eps.value = cfg.epsilon; if (intensity) intensity.value = cfg.minIntensity || 1.2; updateWinsLossesUI(); }
   function startWatchdog() { if (watchdogInterval) clearInterval(watchdogInterval); watchdogInterval = setInterval(() => { const now = Date.now(); if (wsState !== 'connected') return; if (lastTickProcessedAt > 0 && now - lastTickProcessedAt > WATCHDOG_TICK_TIMEOUT) { if (ws) ws.close(); scheduleReconnect(); } }, WATCHDOG_INTERVAL); }
-  let subObserver = null, lastFlyoutNode = null;
-  function setupFlyoutObserver() {
-    if (flyoutObserver) return;
-    flyoutObserver = new MutationObserver(() => {
-      const flyout = document.querySelector(SEL_FLYOUT);
-      if (flyout) {
-        if (flyout !== lastFlyoutNode) {
-          if (subObserver) subObserver.disconnect();
-          lastFlyoutNode = flyout;
-          subObserver = new MutationObserver(() => processFlyout(flyout));
-          subObserver.observe(flyout, { childList: true, subtree: true, characterData: true });
-          processFlyout(flyout);
-        }
-      } else {
-        if (subObserver) { subObserver.disconnect(); subObserver = null; lastFlyoutNode = null; }
-        if (realOpenCount !== 0) {
-          realOpenCount = 0;
-          updateRealExecStateFromDOM(0, { pnl: lastSeenPnL, result: lastSeenPnL > 0 ? 'WIN' : 'LOSS' });
-        }
-      }
-    });
-    flyoutObserver.observe(document.body, { childList: true, subtree: true });
-  }
 
-  function processFlyout(flyout) {
-      const text = flyout.innerText;
-
-      // Error Correction: Check if this is a PURCHASE confirmation
-      if (text.includes("Contract bought") || text.includes("ID:")) {
-        const sig = signals.find(s => s.result === 'PENDING' && s.isReal && !s.startTickIndex);
-        if (sig) {
-          // Corrected: The contract starts on the NEXT tick, not the current one
-          sig.startTickIndex = tickSeq + 1;
-          sig.startTime = Date.now();
-          console.log(`[System] Contract Confirmed. Start Tick anchored at: ${sig.startTickIndex}`);
-
-          const real = realTrades.find(t => t.result === 'PENDING' && !t.startTickIndex);
-          if (real) {
-            real.startTickIndex = sig.startTickIndex;
-            real.startTime = sig.startTime;
-          }
-        }
-      }
-      const hasProfitClass = !!flyout.querySelector('.dc-contract-card--profit, .dc-contract-card__profit-loss--is-profit, .dc-contract-card-item__body--profit');
-      const hasLossClass = !!flyout.querySelector('.dc-contract-card--loss, .dc-contract-card__profit-loss--is-loss, .dc-contract-card-item__body--loss');
-
-      // Track real-time PnL from the flyout while trade is open
-      // Use specific selectors if possible, otherwise regex on innerText
-      const pnlEl = flyout.querySelector('.dc-contract-card__profit-loss-label, .dc-status-colored-text, .dc-contract-card-item__body--profit span[data-testid="dt_span"], .dc-contract-card-item__body--loss span[data-testid="dt_span"]');
-      const profitValEl = flyout.querySelector('.dc-contract-card-item__body--profit span[data-testid="dt_span"]');
-      const lossValEl = flyout.querySelector('.dc-contract-card-item__body--loss span[data-testid="dt_span"]');
-
-      if (profitValEl || lossValEl) {
-        const val = parseFloat((profitValEl || lossValEl).innerText.replace(/[^-0-9.]/g, ''));
-        if (!isNaN(val)) lastSeenPnL = val;
-      } else if (pnlEl) {
-        const val = parseFloat(pnlEl.innerText.replace(/[^-0-9.]/g, ''));
-        if (!isNaN(val)) lastSeenPnL = val;
-      } else {
-        const pnlRegex = /(?:Total\s+profit\/loss|Profit\/Loss)[:\s]*([+-]?\d+\.?\d*)/i;
-        const pnlMatch = text.match(pnlRegex);
-        if (pnlMatch) {
-          lastSeenPnL = parseFloat(pnlMatch[1]);
-        }
-      }
-
-      let count = text.includes('no open positions') ? 0 : (text.match(/(\d+)\s+open\s+position/i) ? parseInt(text.match(/(\d+)\s+open\s+position/i)[1], 10) : realOpenCount);
-      let closedResult = null;
-
-      // EXPLICIT WIN/LOSS DETECTION
-      // Definite Win: Profit class or positive lastSeenPnL
-      const isDefiniteWin = hasProfitClass || lastSeenPnL > 0;
-      // Definite Loss: Contract value 0.00, Loss class, "Loss" text, or non-positive lastSeenPnL
-      const isDefiniteLoss = hasLossClass || /Contract\s+value:\s*0\.00/i.test(text) || /Loss/i.test(text) || lastSeenPnL < 0 || (lastSeenPnL === 0 && !isDefiniteWin);
-
-      // Detection of terminal state
-      // 'Total profit/loss' is present while open, so only use it if 'Closed' or '0.00' is also present
-      const isClosed = text.includes('Closed') || /Contract\s+value:\s*0\.00/i.test(text);
-
-      if (isClosed) {
-        closedResult = { pnl: lastSeenPnL, result: isDefiniteWin ? 'WIN' : 'LOSS' };
-      } else if (text.includes('no open positions') && realExecState === 'OPEN') {
-        closedResult = { pnl: lastSeenPnL, result: isDefiniteWin ? 'WIN' : 'LOSS' };
-      }
-
-      if (count !== realOpenCount || closedResult) {
-        realOpenCount = count;
-        updateRealExecStateFromDOM(count, closedResult);
-      }
-  }
-  function updateRealExecStateFromDOM(count, closedResult) {
-    if (closedResult && (realExecState === 'OPEN' || realExecState === 'OPEN_PENDING' || realExecState === 'RECOVERY')) {
-      finalizeRealTrade(closedResult);
-      realExecState = 'IDLE';
-      realLockReason = '';
-      lastSeenPnL = 0;
-    } else if (count === 0 && (realExecState === 'OPEN' || realExecState === 'RECOVERY')) {
-      // Final fallback if flyout disappears and we didn't catch a closed result
-      finalizeRealTrade({ pnl: lastSeenPnL, result: lastSeenPnL > 0 ? 'WIN' : 'LOSS' });
-      realExecState = 'IDLE';
-      realLockReason = '';
-      lastSeenPnL = 0;
-    }
-    if (count > 0 && ['IDLE', 'OPEN_PENDING'].includes(realExecState)) {
-      realExecState = 'OPEN';
-      lastSeenPnL = 0;
-      const pending = signals.find(s => s.result === 'PENDING' && !s.entryPriceReal);
-      if (pending && ticks.length) {
-        pending.entryPriceReal = ticks[ticks.length - 1].price;
-        updateSignalsUI();
-      }
-    }
-    updateRealUI();
-  }
-  function finalizeRealTrade(res) {
-    if (!realTrades.length) return;
-    const last = realTrades[realTrades.length - 1];
-    if (last.result !== 'PENDING') return;
-    last.result = res.result || 'LOSS';
-    last.pnl = res.pnl || 0;
-    if (last.result === 'WIN') realWins++;
-    else realLosses++;
-    realPnl += last.pnl;
-    const simTrade = last.signalRef || signals.find(s => s.result === 'PENDING' && s.isReal);
-    if (simTrade) {
-      simTrade.result = res.result;
-      simTrade.priceAfter = ticks.length ? ticks[ticks.length - 1].price : simTrade.price;
-    }
-    lastTradeClosedAt = Date.now();
-    lastTradeClosedTick = tickSeq;
-    if (realExecTimer) { clearTimeout(realExecTimer); realExecTimer = null; }
-    updateRealUI();
-    updateSignalsUI();
-  }
-  async function executeRealTrade(side) {
-    if (Date.now() - lastRealTradeAt < cfg.realCooldownMs) return;
-    const buyLabel = side === 'BUY' ? 'Rise' : 'Fall', activeClass = side === 'BUY' ? CLASS_RISE_ACTIVE : CLASS_FALL_ACTIVE;
-    try {
-      if (!await setRealTradeSide(buyLabel, activeClass)) throw new Error('side_failed');
-      if (!await waitRealBuyReady()) throw new Error('not_ready');
-      const btn = document.querySelector(SEL_PURCHASE_BTN); if (!btn || !btn.classList.contains(activeClass)) throw new Error('btn_mismatch');
-      simulateExternalClick(btn); lastRealTradeAt = Date.now();
-      const signalToMark = signals.find(s => s.result === 'PENDING' && s.isReal);
-      realTrades.push({ time: Date.now(), signal: side, side: buyLabel, result: 'PENDING', signalRef: signalToMark, startTickIndex: null, startTime: null });
-      realExecTimer = setTimeout(() => { if (['OPEN_PENDING', 'OPEN'].includes(realExecState)) { realExecState = 'RECOVERY'; realLockReason = 'TIMEOUT'; updateRealUI(); } }, cfg.realTimeoutMs);
-    } catch (e) { realLockReason = 'ERR:' + e.message; updateRealUI(); setTimeout(() => { if (realExecState === 'OPEN_PENDING') { realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); } }, 3000); }
-  }
-  async function setRealTradeSide(label, activeClass) {
-    for (let i = 0; i < 3; i++) {
-      const btn = document.querySelector(SEL_PURCHASE_BTN);
-      if (btn && btn.classList.contains(activeClass)) return true;
-      const target = Array.from(document.querySelectorAll(SEL_SIDE_BTNS)).find(b => b.innerText.includes(label));
-      if (target) {
-        simulateExternalClick(target);
-        await new Promise(r => setTimeout(r, 150)); // Faster response
-      } else {
-        await new Promise(r => setTimeout(r, 50));
-      }
-    }
-    return false;
-  }
-  function simulateExternalClick(el) { const opts = { bubbles: true, cancelable: true, view: window }; el.dispatchEvent(new MouseEvent('mouseenter', opts)); el.dispatchEvent(new MouseEvent('mousedown', opts)); el.focus(); el.dispatchEvent(new MouseEvent('mouseup', opts)); el.dispatchEvent(new MouseEvent('click', opts)); el.dispatchEvent(new MouseEvent('mouseleave', opts)); }
-  async function waitRealBuyReady() {
-    for (let i = 0; i < 5; i++) {
-      const btn = document.querySelector(SEL_PURCHASE_BTN);
-      if (btn && btn.getAttribute('data-loading') !== 'true' && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') return true;
-      await new Promise(r => setTimeout(r, 100)); // Shorter wait increments
-    }
-    return false;
-  }
-  function init() { if (document.getElementById('tt-overlay')) return; cfg = loadCfg(); buildOverlay(); connect(); startWatchdog(); setupFlyoutObserver(); window._tt_cfg = cfg; window._tt_detect = detectSignal; }
+  function init() { if (document.getElementById('tt-overlay')) return; cfg = loadCfg(); buildOverlay(); connect(); startWatchdog(); window._tt_cfg = cfg; window._tt_detect = detectSignal; }
   if (document.body) init(); else document.addEventListener('DOMContentLoaded', init);
 })();
